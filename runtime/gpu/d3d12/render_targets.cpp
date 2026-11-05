@@ -148,8 +148,9 @@ void main(uint3 id : SV_DispatchThreadID)
     uint log_bpp = 2u;
     if (xe_source_depth != 0u)
     {
-        // (The stencil isn't read: it's 0.)
-        packed.x = (xe_source_depth == 1u ? uint(saturate(c.x) * 16777215.0 + 0.5) : XeFloat32To20e4(c.x)) << 8u;
+        // (The stencil isn't read: it's 0.) 24-bit depth is clamped: 1.0 * 16777215 + 0.5 rounds to 2^24 in a float, which
+        // the shift loses, so the far plane and depth cleared to 1.0 resolved as 0, the nearest depth.
+        packed.x = (xe_source_depth == 1u ? min(uint(saturate(c.x) * 16777215.0 + 0.5), 0xFFFFFFu) : XeFloat32To20e4(c.x)) << 8u;
     }
     else
     {
@@ -342,8 +343,8 @@ uint XeWord(float4 value, uint stencil)
         return f32tof16(value.x) | (f32tof16(value.y) << 16u);
     case 4u:
         return asuint(value.x);
-    case 8u:
-        return (XeUnorm(value.x, 16777215.0) << 8u) | (stencil & 0xFFu);
+    case 8u: // (clamped as the resolve's: 1.0 rounds to 2^24)
+        return (min(XeUnorm(value.x, 16777215.0), 0xFFFFFFu) << 8u) | (stencil & 0xFFu);
     default:
         return (XeFloat32To20e4(value.x) << 8u) | (stencil & 0xFFu);
     }

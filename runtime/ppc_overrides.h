@@ -15,6 +15,25 @@ void GuestTrap(PPCContext& ctx, uint8_t* base, uint32_t address, uint32_t instru
 #define PPC_TRAP(address, instruction) GuestTrap(ctx, base, address, instruction)
 #define PPC_SWITCH_OUT_OF_RANGE(address, index) GuestSwitchOutOfRange(address, index)
 
+// Indirect calls (bctr, bctrl, blrl) take the host function from the table after the image (main.cpp), at the slot of
+// the target's address. XenonRecomp's lookup reads any address's slot, outside the table for a target outside the code;
+// here a target that isn't a function's start (outside the code, not a multiple of 4, or a slot without a function)
+// ends the game with its address (runtime/guest_traps.cpp). With the table read-only, a pointer the game's code
+// corrupted reaches no host code but the game's functions.
+[[noreturn]] void GuestBadIndirectCall(PPCContext& ctx, uint8_t* base, uint32_t target);
+#define PPC_CALL_INDIRECT_FUNC(x)                                                                                              \
+    do                                                                                                                         \
+    {                                                                                                                          \
+        const uint32_t ppcCallTarget = uint32_t(x);                                                                            \
+        const uint32_t ppcCallOffset = ppcCallTarget - uint32_t(PPC_CODE_BASE);                                                \
+        PPCFunc* const ppcCallFunction = ppcCallOffset < uint32_t(PPC_CODE_SIZE) && (ppcCallOffset & 3) == 0                   \
+            ? PPC_LOOKUP_FUNC(base, ppcCallTarget)                                                                             \
+            : nullptr;                                                                                                         \
+        if (__builtin_expect(ppcCallFunction == nullptr, 0))                                                                   \
+            GuestBadIndirectCall(ctx, base, ppcCallTarget);                                                                    \
+        ppcCallFunction(ctx, base);                                                                                            \
+    } while (0)
+
 // setjmp and longjmp: the host jmp_buf kept for each guest buffer, a table the runtime keeps (runtime/guest_setjmp.cpp)
 // rather than XenonRecomp's default in the generated code, which needs the C++ standard library's containers.
 extern "C" void* PPCJmpBuf(uint32_t guestBuffer);

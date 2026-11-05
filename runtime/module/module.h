@@ -16,7 +16,7 @@ struct PPCFuncMapping;
 
 // Bumped when anything the module and the executable share changes: this struct, the functions either exports to the
 // other (doa4.def, doa4_ppc.def), the store map, what the shims declare.
-constexpr uint32_t kPPCModuleInterface = 1;
+constexpr uint32_t kPPCModuleInterface = 2;
 
 struct PPCModuleInfo
 {

@@ -1,4 +1,5 @@
-// Guest traps and jump table indices out of range, which the generated code reports (see ppc_overrides.h).
+// Guest traps, jump table indices out of range and indirect calls to what isn't a function, which the generated code
+// reports (see ppc_overrides.h).
 #include "crash_handler.h"
 #include "guest_abi.h"
 #include "log.h"
@@ -71,5 +72,18 @@ void GuestTrap(PPCContext& ctx, uint8_t* base, uint32_t address, uint32_t instru
 {
     char message[160];
     snprintf(message, sizeof(message), "Jump table at %08X: index %u is beyond the table, and the game can't go on.", address, index);
+    crash::Fatal(message);
+}
+
+// PPC_CALL_INDIRECT_FUNC: an indirect call whose target isn't a function's start. Every code pointer in the game targets
+// one (ANALYSIS.md, Computed branches and indirect targets), so it's a corrupted pointer or code the recompilation
+// doesn't have (an exception's funclets). The game ends with a message (crash::Fatal); LR is the call's return address
+// (bctrl, blrl) or, for a tail call (bctr), its caller's.
+[[noreturn]] void GuestBadIndirectCall(PPCContext& ctx, uint8_t* base, uint32_t target)
+{
+    (void)base;
+    char message[160];
+    snprintf(message, sizeof(message), "Indirect call to %08X (LR %08X), which isn't a function's start, and the game can't go on.",
+        target, uint32_t(ctx.lr));
     crash::Fatal(message);
 }

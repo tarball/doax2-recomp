@@ -4,6 +4,7 @@
 ?DOA4QueryTimeBase@@YA_KXZ
 ?GuestTrap@@YAXAEAUPPCContext@@PEAEII@Z
 ?GuestSwitchOutOfRange@@YAXII@Z
+?GuestBadIndirectCall@@YAXAEAUPPCContext@@PEAEI@Z
 ?XmaRegisterWrite@@YAXII@Z
 PPCStoreMiss
 PPCJmpBuf

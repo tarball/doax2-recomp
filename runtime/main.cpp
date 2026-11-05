@@ -55,6 +55,9 @@ namespace
     // The game's code module (module/loader.h): its function table.
     module::Loaded g_gameCode;
 
+    // The indirect call table after the image: a host function's address for every 4 bytes of code (PPC_LOOKUP_FUNC).
+    constexpr uint32_t kLookupTableSize = uint32_t(PPC_CODE_SIZE * 2);
+
     // The game's image (default.pe) into guest memory.
     bool LoadImage(const std::vector<uint8_t>& image)
     {
@@ -273,12 +276,18 @@ namespace
         return true;
     }
 
-    void RegisterFunctions()
+    bool RegisterFunctions()
     {
         for (const PPCFuncMapping* mapping = g_gameCode.functions; mapping->host != nullptr; ++mapping)
             PPC_LOOKUP_FUNC(guest::g_base, mapping->guest) = mapping->host;
 
         imports::RegisterThunks();
+
+        // Then the table is read-only for the host too, not only in the guest's bookkeeping: the generated code's
+        // stores aren't checked, and one into the table could point an indirect call at any host address (the
+        // indirect calls check that their target is in the code, ppc_overrides.h, so they read only the table).
+        DWORD previous;
+        return VirtualProtect(guest::ToHost(uint32_t(PPC_IMAGE_BASE + PPC_IMAGE_SIZE)), kLookupTableSize, PAGE_READONLY, &previous);
     }
 }
 
@@ -329,7 +338,6 @@ int main(int argc, char** argv)
         return Fail("Can't reserve the 4 GB of address space the game needs.");
 
     // The image, the indirect call table after it and the GPU's and the XMA decoder's registers are never handed out.
-    constexpr uint32_t kLookupTableSize = uint32_t(PPC_CODE_SIZE * 2);
     if (!guest::ReserveFixed(uint32_t(PPC_IMAGE_BASE), uint32_t(PPC_IMAGE_SIZE), guest::kPageReadWrite) ||
         !guest::ReserveFixed(uint32_t(PPC_IMAGE_BASE + PPC_IMAGE_SIZE), kLookupTableSize, guest::kPageReadOnly) ||
         !guest::ReserveFixed(gpu::kRegisterWindow, gpu::kRegisterWindowSize, guest::kPageReadWrite) ||
@@ -350,7 +358,8 @@ int main(int argc, char** argv)
     debug::WriteWatchOnImageLoaded();
 
     imports::ResolveSlots();
-    RegisterFunctions();
+    if (!RegisterFunctions())
+        return Fail("Can't make the game's function table read-only.");
 
     if (!kernel::InitializeExecutableModule(xex, uint32_t(PPC_IMAGE_BASE), uint32_t(PPC_IMAGE_SIZE)))
         return Fail("Can't load the game's executable.");

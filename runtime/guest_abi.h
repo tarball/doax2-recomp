@@ -70,6 +70,17 @@ namespace guest
         return address ? reinterpret_cast<T*>(g_base + address) : nullptr;
     }
 
+    // The host function of the guest function that starts at `address`, or nullptr if none does (outside the code, not
+    // a multiple of 4, or a slot without a function): PPC_LOOKUP_FUNC alone reads outside its table for an address
+    // outside the code. The generated code's indirect calls check the same way (ppc_overrides.h).
+    inline PPCFunc* LookupFunction(uint32_t address)
+    {
+        const uint32_t offset = address - uint32_t(PPC_CODE_BASE);
+        if (offset >= uint32_t(PPC_CODE_SIZE) || (offset & 3) != 0)
+            return nullptr;
+        return PPC_LOOKUP_FUNC(g_base, address);
+    }
+
     namespace detail
     {
         inline PPCRegister& ArgumentRegister(PPCContext& ctx, size_t index)

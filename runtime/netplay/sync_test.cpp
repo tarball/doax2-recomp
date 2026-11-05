@@ -268,7 +268,8 @@ namespace netplay::synctest
             std::map<uint64_t, std::string> busy;
             std::vector<uint64_t> firstWrites; // pages written in each frame of the first run
             // The image's pages the game shares with others, tracked by bytes in the first run: the bytes each side
-            // changed.
+            // changed. And of those the game's description of its memory covers (GameState::savedMemory), the bytes it
+            // gives the game.
             std::vector<uint32_t> byteTracked;
             struct Owners
             {
@@ -277,9 +278,12 @@ namespace netplay::synctest
             };
             std::map<uint32_t, Owners> owners;
             uint64_t byteSteps = 0, byteLost = 0;
+            std::map<uint32_t, std::bitset<kPageSize>> describedBytes;
+            // The bytes of those pages that changed in the first run without the tracker seeing a write to them.
+            std::map<uint32_t, std::bitset<kPageSize>> unseen;
             // At the end of the first run: the game's pages (loaded and compared; of those it shares with others, only
-            // the bytes the game changed while tracked and others didn't, `shared`), mixed pages (shared, not tracked by
-            // bytes: neither), the others.
+            // the bytes its description gives it, or the game changed while tracked, and others didn't, `shared`), mixed
+            // pages (shared, not tracked by bytes: neither), the others.
             std::vector<uint32_t> loaded, mixed, others;
             std::map<uint32_t, std::bitset<kPageSize>> shared; // page -> the bytes loaded and compared
             size_t unsaved = 0;
@@ -820,11 +824,12 @@ namespace netplay::synctest
                     }
                 }
             }
-            if (!test.owners.empty())
+            if (!test.byteTracked.empty())
             {
                 line("\nPages shared with others, tracked by bytes in the first run (%llu writes stepped, %llu not recorded); loaded and "
-                     "compared: the bytes the game changed and others didn't. The others' bytes, and the other writers of the game's "
-                     "bytes (not loaded):\n",
+                     "compared: the bytes the game's description of its memory gives it, or on a page it doesn't describe those the game "
+                     "changed, but those others changed. The others' bytes, the other writers of the game's bytes (not loaded), and the "
+                     "bytes that changed without the tracker seeing a write (one made while another thread's was single-stepped):\n",
                     (unsigned long long)test.byteSteps, (unsigned long long)test.byteLost);
                 // A page's bytes in `bytes`, as runs (32 at most).
                 auto runs = [](uint32_t page, const std::bitset<kPageSize>& bytes) {
@@ -844,11 +849,18 @@ namespace netplay::synctest
                         i = end;
                     }
                 };
-                for (const auto& [page, owners] : test.owners)
+                for (uint32_t page : test.byteTracked)
                 {
-                    const bool loaded = test.shared.count(page) != 0;
-                    line("  %08X%s: the game's %zu bytes, others' %zu (%zu both):", page * kPageSize, loaded ? "" : " (not loaded)",
-                        owners.game.count(), owners.others.count(), (owners.game & owners.others).count());
+                    const auto found = test.owners.find(page);
+                    const auto unseen = test.unseen.find(page);
+                    const auto loaded = test.shared.find(page);
+                    if (found == test.owners.end() && unseen == test.unseen.end())
+                        continue;
+                    const Test::Owners owners = found != test.owners.end() ? found->second : Test::Owners{};
+                    line("  %08X: the game's %zu bytes, others' %zu (%zu both), %zu changed unseen; %zu loaded%s:", page * kPageSize,
+                        owners.game.count(), owners.others.count(), (owners.game & owners.others).count(),
+                        unseen != test.unseen.end() ? unseen->second.count() : size_t(0), loaded != test.shared.end() ? loaded->second.count() : size_t(0),
+                        test.describedBytes.count(page) ? " (as the game's description gives them)" : "");
                     runs(page, owners.others);
                     line("\n");
                     for (const auto& [writer, bytes] : owners.otherWriters)
@@ -857,6 +869,12 @@ namespace netplay::synctest
                             continue;
                         line("    [%s]:", WriterText(writer).c_str());
                         runs(page, bytes & owners.game);
+                        line("\n");
+                    }
+                    if (unseen != test.unseen.end())
+                    {
+                        line("    changed unseen:");
+                        runs(page, unseen->second);
                         line("\n");
                     }
                 }
@@ -1218,6 +1236,23 @@ namespace netplay::synctest
                             test.byteTracked.push_back(page);
                     }
                     tracker::TrackBytes(test.byteTracked); // kept as they are now, then tracked by bytes
+                    // The bytes the game's description of its memory gives it on those pages, which the savestate holds
+                    // rather than the bytes the tracker saw the game change: a write while another thread's write to the
+                    // page is single-stepped (the page writable meanwhile) isn't seen (Classify).
+                    if (game.savedMemory)
+                    {
+                        const GameState::SavedMemory memory = game.savedMemory();
+                        for (uint32_t page : test.byteTracked)
+                        {
+                            const uint32_t address = page * kPageSize;
+                            const auto partial = std::find_if(memory.partial.begin(), memory.partial.end(),
+                                [&](const std::pair<uint32_t, const std::bitset<kPageSize>*>& entry) { return entry.first == address; });
+                            if (partial != memory.partial.end())
+                                test.describedBytes[page] = *partial->second;
+                            else if (InRanges(memory.ranges, address))
+                                test.describedBytes[page].set();
+                        }
+                    }
                 }
                 Collect(game, tracker::NextFrame(), test.knownWriters);
             }
@@ -1231,14 +1266,40 @@ namespace netplay::synctest
         {
             test.gameHeap = heaps::Ranges(heaps::GameHeap());
             test.processHeap = heaps::Ranges(heaps::ProcessHeap());
-            // Shared pages tracked by bytes: the game's bytes, or nothing if the game changed none.
+            // Shared pages tracked by bytes: the game's bytes, as its description of its memory gives them (as the savestates
+            // saved at every frame hold them), or else those it changed, less those others changed; nothing if none are
+            // left. Not only those the tracker saw it change: a write by one thread while another's write to the page is
+            // single-stepped goes unseen (DOA4's fight's task's record of the phase it last ran, beside the job thread's
+            // lock, which that thread takes every 2 ms, was left out so in some tests from fight frame 0, and the replay
+            // ran the loading's setup again).
             for (uint32_t page : test.byteTracked)
             {
                 const auto owners = test.owners.find(page);
-                if (owners == test.owners.end() || owners->second.game.none() || !Saved(page))
+                const auto described = test.describedBytes.find(page);
+                const uint8_t* saved = Saved(page);
+                if (!saved)
+                    continue;
+                // What changed without the tracker seeing a write to it (for the report): the page as the first run leaves it.
+                std::bitset<kPageSize> seen, unseen;
+                if (owners != test.owners.end())
+                    seen = owners->second.game | owners->second.others;
+                const uint8_t* now = guest::ToHost(page * kPageSize);
+                for (uint32_t i = 0; i < kPageSize; i++)
+                {
+                    if (now[i] != saved[i] && !seen[i])
+                        unseen.set(i);
+                }
+                if (unseen.any())
+                    test.unseen[page] = unseen;
+                if (owners == test.owners.end() && described == test.describedBytes.end())
+                    continue;
+                std::bitset<kPageSize> bytes = described != test.describedBytes.end() ? described->second : owners->second.game;
+                if (owners != test.owners.end())
+                    bytes &= ~owners->second.others;
+                if (bytes.none())
                     continue;
                 test.loaded.push_back(page);
-                test.shared[page] = owners->second.game & ~owners->second.others;
+                test.shared[page] = bytes;
             }
             for (const auto& [page, writers] : test.firstWriters)
             {

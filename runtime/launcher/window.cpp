@@ -25,8 +25,7 @@ namespace launcher
         constexpr COLORREF kHeadingColor = RGB(0x00, 0x33, 0x99), kNoteColor = RGB(0x5F, 0x5F, 0x5F);
 
         const wchar_t kNote[] = L"Both players must choose the same. Rollback plays better over the internet; lockstep waits for both players' "
-                                L"moves every frame.\n\nOnly play with people you trust, on a network you trust: netplay hasn't had a "
-                                L"security review. Over the internet, the host's UDP port must be forwarded to the host's PC.";
+                                L"moves every frame.\n\nOver the internet, the host's UDP port must be forwarded to the host's PC.";
 
         enum Id : int
         {

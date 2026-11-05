@@ -16,7 +16,7 @@ image to play.**
 
 ## How to install
 
-1. Download the latest release's zip from [Releases](https://github.com/tarball/doax2-recomp-releases/releases).
+1. Download the latest release's zip from [Releases](https://github.com/tarball/doax2-recomp/releases).
 2. Extract it to a folder of its own that you can write to, such as one in Documents (not Program Files).
 3. Run `DOAX2 Launcher.exe`. If Windows says it doesn't recognize the app, choose More info, then Run anyway.
 4. Select your Dead or Alive Xtreme 2 (USA) disc image, then press Launch.

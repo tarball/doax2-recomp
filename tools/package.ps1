@@ -25,7 +25,7 @@ $executable = 'doax2'
 $launcher = "$prefix Launcher.exe"
 $folderName = 'doax2-recomp'
 # The release repository, a commit and a tag a release, and the XenonRecomp fork.
-$sourceRepository = 'https://github.com/tarball/doax2-recomp-releases'
+$sourceRepository = 'https://github.com/tarball/doax2-recomp'
 $xenonRepository = 'https://github.com/tarball/XenonRecomp'
 $xenonUpstream = 'https://github.com/hedge-dev/XenonRecomp'
 

@@ -13,8 +13,10 @@
 #include "kernel/threads.h"
 #include "module/crt_exports.h"
 #include "netplay/frame.h"
+#include "netplay/protocol.h"
 #include "netplay/replay.h"
 #include "netplay/session.h"
+#include "netplay/session_testing.h"
 #include "page_heap.h"
 #include "settings.h"
 #include "util/image.h"
@@ -780,6 +782,58 @@ static void test_suspension()
     g_spinnerStop = true;
     CHECK(WaitForThread(call, handle) == status::kSuccess, "the spinning thread finished");
     call(__imp__NtClose, handle);
+}
+
+// Calls into guest code by address: only a function's start in the code finds a host function, whether the runtime
+// calls (guest::LookupFunction) or the generated code (PPC_CALL_INDIRECT_FUNC, ppc_overrides.h, whose failures end the
+// game). XenonRecomp's lookup alone reads outside its table for an address outside the code.
+static void IndirectCallee(PPCContext& ctx, uint8_t*)
+{
+    ctx.r3.u64 = ctx.r3.u64 * 3;
+}
+
+static void test_function_lookup()
+{
+    const uint32_t function = RegisterGuestFunction(8, IndirectCallee);
+    CHECK(guest::LookupFunction(function) == IndirectCallee, "a registered function's start");
+    CHECK(guest::LookupFunction(function + 4) == nullptr, "a slot without a function");
+    CHECK(guest::LookupFunction(function + 2) == nullptr && guest::LookupFunction(function + 1) == nullptr, "not a multiple of 4");
+    CHECK(guest::LookupFunction(uint32_t(PPC_CODE_BASE) - 4) == nullptr, "below the code");
+    CHECK(guest::LookupFunction(uint32_t(PPC_CODE_BASE + PPC_CODE_SIZE)) == nullptr, "past the code");
+    CHECK(guest::LookupFunction(0) == nullptr && guest::LookupFunction(0xFFFFFFFC) == nullptr, "far outside");
+
+    // As the generated code calls, with its ctx and base.
+    PPCContext ctx{};
+    uint8_t* base = guest::g_base;
+    ctx.r3.u64 = 14;
+    const uint32_t target = function;
+    PPC_CALL_INDIRECT_FUNC(target);
+    CHECK(ctx.r3.u64 == 42, "an indirect call reaches the function (r3 %llu)", (unsigned long long)ctx.r3.u64);
+}
+
+// The failures end the process, so each runs in one of its own (runtime_tests --indirect-call <hex address>, below main's
+// tests): it has to end with the message naming the target, not call through a slot outside the table or a null one.
+static void test_bad_indirect_calls()
+{
+    char executable[MAX_PATH];
+    GetModuleFileNameA(nullptr, executable, MAX_PATH);
+    _putenv_s(GAME_PREFIX "_HEADLESS", "1"); // no message box
+    const uint32_t unregistered = uint32_t(PPC_CODE_BASE) + 0x100; // nothing registers functions in that process
+    for (const uint32_t target : { uint32_t(PPC_CODE_BASE) - 4, unregistered, unregistered + 2, 0x8A000000u, 0u })
+    {
+        char command[MAX_PATH + 64];
+        snprintf(command, sizeof(command), "\"%s\" --indirect-call %08X 2>&1", executable, target);
+        FILE* child = _popen(command, "r");
+        std::string output;
+        char line[512];
+        while (child && fgets(line, sizeof(line), child))
+            output += line;
+        const int status = child ? _pclose(child) : -1;
+        char expected[64];
+        snprintf(expected, sizeof(expected), "Indirect call to %08X", target);
+        CHECK(status == 1 && output.find(expected) != std::string::npos, "%08X ends the process with its message (exit %d: %s)", target,
+            status, output.c_str());
+    }
 }
 
 // Semaphores: each wait takes one, releases can't pass the limit; by handle, and in guest memory (KSEMAPHORE) waited
@@ -2071,9 +2125,383 @@ static void test_module_crt_exports()
 
 #define RUN(test) (printf("- %s\n", #test), test())
 
-int main()
+// ---------------------------------------------------------------------------------------------
+// Netplay's packet handling (netplay/protocol.h, session_testing.h): the joining machine takes only the host's answer to
+// its own hello, the host only a peer whose token came back from its address, every packet after that only from the
+// peer and with the token, malformed packets change nothing, and what a peer can make this machine keep is bounded.
+
+namespace
+{
+    namespace proto = netplay::session::protocol;
+    namespace nt = netplay::session::testing;
+
+    proto::Header PacketHeader(proto::Type type, uint64_t token)
+    {
+        proto::Header header{};
+        strncpy(header.game, GAME_PREFIX, sizeof(header.game));
+        header.version = proto::kVersion;
+        header.type = uint16_t(type);
+        header.session = token;
+        header.time = 1000;
+        return header;
+    }
+
+    proto::Identity LocalIdentity()
+    {
+        proto::Identity identity{};
+        nt::LocalIdentityBytes(&identity, sizeof(identity));
+        return identity;
+    }
+
+    proto::Hello MakeHello(uint64_t nonce, const proto::Identity& identity)
+    {
+        proto::Hello hello{};
+        hello.header = PacketHeader(proto::Type::kHello, 0);
+        hello.nonce = nonce;
+        hello.identity = identity;
+        return hello;
+    }
+
+    proto::Welcome MakeWelcome(uint64_t token, uint64_t nonce, const proto::Identity& identity)
+    {
+        proto::Welcome welcome{};
+        welcome.header = PacketHeader(proto::Type::kWelcome, token);
+        welcome.nonce = nonce;
+        welcome.seed = 7;
+        welcome.delay = 3;
+        welcome.fightDelay = 2;
+        welcome.window = 8;
+        welcome.identity = identity;
+        return welcome;
+    }
+
+    proto::Refuse MakeRefuse(uint64_t nonce, const proto::Identity& identity)
+    {
+        proto::Refuse refuse{};
+        refuse.header = PacketHeader(proto::Type::kRefuse, 0);
+        refuse.nonce = nonce;
+        refuse.identity = identity;
+        return refuse;
+    }
+
+    proto::Alive MakeAlive(uint64_t token, uint8_t where = 0)
+    {
+        proto::Alive alive{};
+        alive.header = PacketHeader(proto::Type::kAlive, token);
+        alive.key = proto::kNoKey;
+        alive.where = where;
+        return alive;
+    }
+
+    proto::Bye MakeBye(uint64_t token)
+    {
+        proto::Bye bye{};
+        bye.header = PacketHeader(proto::Type::kBye, token);
+        return bye;
+    }
+
+    // A segment packet for the segment `key`, with `pads` pads from frame `first` and `checksums` checksums from frame
+    // `firstChecksum`, and the setup if `setup` isn't null; `claimedPads` lies about the pads' count when given.
+    std::vector<uint8_t> MakeSegment(uint64_t token, uint32_t key, uint32_t first, uint32_t pads, uint32_t firstChecksum = 0,
+        uint32_t checksums = 0, const proto::Digests* setup = nullptr, int claimedPads = -1)
+    {
+        proto::SegmentPacket packet{};
+        packet.header = PacketHeader(proto::Type::kSegment, token);
+        packet.key = key;
+        packet.screen = (key & proto::kFightKey) ? 0 : 0x301;
+        packet.first = first;
+        packet.pads = uint16_t(claimedPads >= 0 ? claimedPads : pads);
+        packet.checksums = uint16_t(checksums);
+        packet.slack = proto::kNoSlack;
+        packet.setup = setup ? proto::kSetupIncluded : 0;
+        packet.delay = 3;
+        const auto append = [](std::vector<uint8_t>& data, const void* bytes, size_t size) {
+            data.insert(data.end(), static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + size);
+        };
+        std::vector<uint8_t> data;
+        append(data, &packet, sizeof(packet));
+        for (uint32_t i = 0; i < pads; i++)
+        {
+            netplay::session::Pad pad{};
+            pad.buttons = uint16_t(0x1000 + i);
+            append(data, &pad, sizeof(pad));
+        }
+        for (uint32_t i = 0; i < checksums; i++)
+        {
+            const proto::Checksum checksum{ firstChecksum + i, 0xC0FFEE00ull + i };
+            append(data, &checksum, sizeof(checksum));
+        }
+        if (setup)
+            append(data, setup, sizeof(*setup));
+        return data;
+    }
+
+    template <typename T>
+    void Feed(const T& packet, nt::Address from)
+    {
+        nt::Feed(&packet, sizeof(packet), from);
+    }
+
+    void Feed(const std::vector<uint8_t>& packet, nt::Address from)
+    {
+        nt::Feed(packet.data(), packet.size(), from);
+    }
+}
+
+static void test_netplay_packets()
+{
+    const nt::Address host{ 0x0A000001, 7000 }, joiner{ 0x0A000002, 50000 }, stranger{ 0x0A000003, 50001 };
+    // SipHash-2-4's reference vector (the tokens' hash).
+    {
+        uint8_t key[16], message[15];
+        for (int i = 0; i < 16; i++)
+            key[i] = uint8_t(i);
+        for (int i = 0; i < 15; i++)
+            message[i] = uint8_t(i);
+        const uint64_t hash = proto::SipHash24(key, message, sizeof(message));
+        CHECK(hash == 0xA129CA6149BE45E5ull, "%016llX", (unsigned long long)hash);
+    }
+    // The host: a hello from anyone with the same identity is welcomed, but the sender becomes the peer only as the
+    // token for its address comes back from it; a spoofed hello costs one welcome and nothing else.
+    {
+        nt::Reset(nt::Role::kHost);
+        const proto::Identity identity = LocalIdentity();
+        Feed(MakeHello(1, identity), stranger);
+        nt::Snapshot s = nt::Inspect();
+        CHECK(s.state == nt::State::kConnecting && s.welcomes == 1 && s.refusals == 0, "state %d, %llu welcomes, %llu refusals", int(s.state),
+            (unsigned long long)s.welcomes, (unsigned long long)s.refusals);
+        Feed(MakeAlive(nt::HostToken(stranger)), joiner); // the stranger's token from another address: nothing
+        Feed(MakeAlive(nt::HostToken(joiner) ^ 2), joiner); // a wrong token: nothing
+        CHECK(nt::Inspect().state == nt::State::kConnecting, "connected on a wrong token");
+        Feed(MakeHello(2, identity), joiner);
+        Feed(MakeAlive(nt::HostToken(joiner), 2), joiner); // the joining machine's first packet with its token
+        s = nt::Inspect();
+        CHECK(s.state == nt::State::kConnected && s.peer == joiner && s.token == nt::HostToken(joiner) && s.welcomes == 2,
+            "state %d, peer %08X:%u, %llu welcomes", int(s.state), s.peer.ip, s.peer.port, (unsigned long long)s.welcomes);
+        CHECK(s.peerWhereKnown && s.peerWhere == 2, "the alive that connected wasn't taken");
+        // Connected: a stranger's packets are dropped, with the right token too; the peer's need the token; the peer's
+        // hello gets the welcome again; impossible values are dropped.
+        Feed(MakeAlive(s.token, 3), stranger);
+        Feed(MakeBye(s.token), stranger);
+        Feed(MakeAlive(s.token ^ 1, 3), joiner);
+        Feed(MakeAlive(s.token, 7), joiner);
+        CHECK(nt::Inspect().state == nt::State::kConnected && nt::Inspect().peerWhere == 2, "state %d, where %u", int(nt::Inspect().state),
+            nt::Inspect().peerWhere);
+        Feed(MakeAlive(s.token, 3), joiner);
+        CHECK(nt::Inspect().peerWhere == 3, "the peer's alive wasn't taken");
+        Feed(MakeHello(2, identity), joiner);
+        CHECK(nt::Inspect().welcomes == 3, "%llu welcomes", (unsigned long long)nt::Inspect().welcomes);
+        Feed(MakeBye(s.token), joiner);
+        CHECK(nt::Inspect().state == nt::State::kEnded, "the peer's bye didn't end the session");
+    }
+    // The host refuses another identity, and answers at most 32 hellos a second, whatever comes.
+    {
+        nt::Reset(nt::Role::kHost);
+        proto::Identity other = LocalIdentity();
+        other.build ^= 1;
+        Feed(MakeHello(1, other), stranger);
+        CHECK(nt::Inspect().refusals == 1 && nt::Inspect().state == nt::State::kConnecting, "%llu refusals", (unsigned long long)nt::Inspect().refusals);
+        for (int i = 0; i < 100; i++)
+            Feed(MakeHello(1, LocalIdentity()), stranger);
+        CHECK(nt::Inspect().welcomes + nt::Inspect().refusals <= 32, "%llu answers", (unsigned long long)(nt::Inspect().welcomes + nt::Inspect().refusals));
+    }
+    // The joining machine takes only the host's answer to its own hello: not a stranger's, not another nonce's, not a
+    // token of 0; and the host's refusal ends the session only with the nonce.
+    {
+        nt::Reset(nt::Role::kJoining, host);
+        const uint64_t nonce = nt::Inspect().nonce;
+        const proto::Identity identity = LocalIdentity();
+        CHECK(nonce != 0, "no nonce");
+        Feed(MakeWelcome(0xABCDEF, nonce, identity), stranger);
+        Feed(MakeWelcome(0xABCDEF, nonce ^ 1, identity), host);
+        Feed(MakeWelcome(0, nonce, identity), host);
+        Feed(MakeRefuse(nonce, identity), stranger);
+        Feed(MakeRefuse(nonce ^ 1, identity), host);
+        Feed(MakeAlive(0xABCDEF), host);
+        CHECK(nt::Inspect().state == nt::State::kConnecting && nt::Inspect().token == 0, "state %d, token %llx", int(nt::Inspect().state),
+            (unsigned long long)nt::Inspect().token);
+        Feed(MakeWelcome(0xABCDEF, nonce, identity), host);
+        const nt::Snapshot after = nt::Inspect();
+        CHECK(after.state == nt::State::kConnected && after.token == 0xABCDEF && after.seed == 7 && after.peer == host, "state %d, token %llx, seed %u",
+            int(after.state), (unsigned long long)after.token, after.seed);
+        nt::Reset(nt::Role::kJoining, host);
+        proto::Identity other = LocalIdentity();
+        other.disc ^= 1;
+        Feed(MakeWelcome(0xABCDEF, nt::Inspect().nonce, other), host);
+        CHECK(nt::Inspect().state == nt::State::kEnded, "another identity's welcome was taken");
+        nt::Reset(nt::Role::kJoining, host);
+        Feed(MakeRefuse(nt::Inspect().nonce, identity), host);
+        CHECK(nt::Inspect().state == nt::State::kEnded, "the host's refusal didn't end the session");
+    }
+    // What the peer can make this machine keep: inputs and checksums within kFramesAhead of its frame of the segment,
+    // segments within kEarlyKept ahead with the same bound from their start; packets past that are dropped.
+    {
+        nt::Reset(nt::Role::kHost);
+        const uint64_t token = nt::HostToken(joiner);
+        nt::Connect(joiner, token);
+        nt::StartSegment(false, 3, 10); // a menu screen at its frame 10: frames up to 138 may come
+        Feed(MakeSegment(token, 0, 3, 8, 3, 8), joiner);
+        nt::Snapshot s = nt::Inspect();
+        CHECK(s.remoteInputs == 8 && s.remoteChecksums == 8, "%zu inputs, %zu checksums", s.remoteInputs, s.remoteChecksums);
+        Feed(MakeSegment(token, 0, 134, 8), joiner); // past the bound: dropped whole
+        Feed(MakeSegment(token, 0, 130, 8), joiner); // at the bound: taken
+        Feed(MakeSegment(token, 0, 3, 0, 500, 4), joiner); // checksums past the bound: skipped
+        s = nt::Inspect();
+        CHECK(s.remoteInputs == 16 && s.remoteChecksums == 8, "%zu inputs, %zu checksums", s.remoteInputs, s.remoteChecksums);
+        for (uint32_t first = 0; first < 2000; first++)
+            Feed(MakeSegment(token, 0, first, proto::kMaxPads, first, proto::kChecksumsSent), joiner);
+        s = nt::Inspect();
+        CHECK(s.remoteInputs <= 138 && s.remoteChecksums <= 138, "%zu inputs, %zu checksums after a flood", s.remoteInputs, s.remoteChecksums);
+        CHECK(s.state == nt::State::kConnected, "the flood ended the session");
+        // Segments ahead: within kEarlyKept of the one started here (its ordinal is 0), from their frame 0, bounded alike;
+        // a key of no segment dropped.
+        Feed(MakeSegment(token, 1, 3, 8), joiner);
+        Feed(MakeSegment(token, 1, 200, 8), joiner);
+        Feed(MakeSegment(token, proto::kEarlyKept + 1, 3, 8), joiner);
+        Feed(MakeSegment(token, proto::kNoKey, 3, 8), joiner);
+        Feed(MakeSegment(token, 0x7FFFFFFF, 3, 8), joiner);
+        s = nt::Inspect();
+        CHECK(s.earlySegments == 1 && s.earlyInputs == 8, "%zu early segments, %zu inputs", s.earlySegments, s.earlyInputs);
+        for (uint32_t ordinal = 2; ordinal < 200; ordinal++)
+            Feed(MakeSegment(token, ordinal | (ordinal & 1 ? proto::kFightKey : 0), 0, 4), joiner);
+        s = nt::Inspect();
+        CHECK(s.earlySegments == proto::kEarlyKept && s.earlyInputs == 4 * (proto::kEarlyKept - 1) + 8, "%zu early segments, %zu inputs",
+            s.earlySegments, s.earlyInputs);
+        // Frames run forget what's behind: the other's inputs before those it has in a row but the last 64, and the
+        // checksums more than 256 frames back.
+        for (int i = 0; i < 400; i++)
+            nt::AdvanceFrame();
+        s = nt::Inspect();
+        CHECK(s.remoteInputs <= 64 && s.remoteChecksums == 0, "%zu inputs, %zu checksums after 400 frames", s.remoteInputs, s.remoteChecksums);
+        // A fight's setup: taken when its digests are within bounds, dropped otherwise.
+        nt::StartSegment(true, 3, 2);
+        const uint32_t fight = proto::kFightKey | 1;
+        proto::Digests digests{};
+        digests.count = 3;
+        digests.parts[0].length = 1;
+        digests.parts[1].length = proto::kHashed;
+        digests.parts[2].length = 200; // not a length a part can have
+        Feed(MakeSegment(token, fight, 3, 2, 0, 0, &digests), joiner);
+        CHECK(nt::Inspect().remoteSetups == 0, "digests with an impossible length were taken");
+        digests.parts[2].length = 24;
+        Feed(MakeSegment(token, fight, 3, 2, 0, 0, &digests), joiner);
+        CHECK(nt::Inspect().remoteSetups == 1, "the setup wasn't taken");
+        digests.count = 13;
+        Feed(MakeSegment(token, fight | 2, 3, 2, 0, 0, &digests), joiner);
+        CHECK(nt::Inspect().remoteSetups == 1, "digests with too many parts were taken");
+    }
+    // What the other machine says it has of this one's inputs counts only as far as this one has made them: a machine
+    // that ended the segment first says it needs nothing more (kNothingNeeded), and this one must still keep the inputs
+    // of the frames it hasn't run; a machine that never says what it has can't make this one keep a whole segment's.
+    {
+        nt::Reset(nt::Role::kHost);
+        const uint64_t token = nt::HostToken(joiner);
+        nt::Connect(joiner, token);
+        nt::StartSegment(false, 3, 0);
+        for (int i = 0; i < 100; i++)
+            nt::AdvanceFrame();
+        std::vector<uint8_t> packet = MakeSegment(token, 0, 3, 0);
+        proto::SegmentPacket fixed;
+        memcpy(&fixed, packet.data(), sizeof(fixed));
+        fixed.received = proto::kNothingNeeded;
+        memcpy(packet.data(), &fixed, sizeof(fixed));
+        Feed(packet, joiner);
+        nt::AdvanceFrame();
+        nt::Snapshot s = nt::Inspect();
+        CHECK(s.peerReceived == 104 && s.localFirst <= s.frame && s.localLast == s.frame + 3, "the other has %u, frame %u, inputs %u-%u",
+            s.peerReceived, s.frame, s.localFirst, s.localLast);
+        fixed.received = 0x00FFFFFF; // a frame far ahead, no machine's
+        memcpy(packet.data(), &fixed, sizeof(fixed));
+        Feed(packet, joiner);
+        nt::AdvanceFrame();
+        s = nt::Inspect();
+        CHECK(s.peerReceived == 105 && s.localFirst <= s.frame && s.localLast == s.frame + 3, "the other has %u, frame %u, inputs %u-%u",
+            s.peerReceived, s.frame, s.localFirst, s.localLast);
+        // Never acknowledged: this machine's inputs more than 1024 frames back go anyway.
+        nt::Reset(nt::Role::kHost);
+        nt::Connect(joiner, token);
+        nt::StartSegment(true, 2, 0);
+        for (int i = 0; i < 3000; i++)
+            nt::AdvanceFrame();
+        s = nt::Inspect();
+        CHECK(s.localInputs <= 1024 + 3 && s.localLast == s.frame + 2, "%zu inputs kept, %u-%u at frame %u", s.localInputs, s.localFirst,
+            s.localLast, s.frame);
+    }
+    // Malformed packets change nothing: every packet type cut short at every length, counts that outrun the datagram,
+    // the wrong game or version, and garbage.
+    {
+        nt::Reset(nt::Role::kHost);
+        const uint64_t token = nt::HostToken(joiner);
+        nt::Connect(joiner, token);
+        nt::StartSegment(false, 3, 10);
+        const proto::Identity identity = LocalIdentity();
+        proto::Digests digests{};
+        digests.count = 2;
+        digests.parts[0].length = 4;
+        digests.parts[1].length = proto::kHashed;
+        std::vector<std::vector<uint8_t>> packets;
+        const auto add = [&](const auto& packet) {
+            packets.emplace_back(reinterpret_cast<const uint8_t*>(&packet), reinterpret_cast<const uint8_t*>(&packet) + sizeof(packet));
+        };
+        add(MakeHello(1, identity));
+        add(MakeWelcome(token, 1, identity));
+        add(MakeRefuse(1, identity));
+        add(MakeAlive(token, 2));
+        add(MakeBye(token));
+        packets.push_back(MakeSegment(token, 0, 3, 8, 3, 8, &digests));
+        const nt::Snapshot before = nt::Inspect();
+        for (const std::vector<uint8_t>& packet : packets)
+        {
+            for (size_t length = 0; length < packet.size(); length++)
+                nt::Feed(packet.data(), length, joiner);
+        }
+        nt::Snapshot s = nt::Inspect();
+        CHECK(s.state == nt::State::kConnected && s.remoteInputs == before.remoteInputs && s.remoteChecksums == before.remoteChecksums &&
+                s.remoteSetups == 0 && !s.peerWhereKnown && s.welcomes == before.welcomes,
+            "state %d, %zu inputs, %zu checksums, %zu setups, where known %d", int(s.state), s.remoteInputs, s.remoteChecksums, s.remoteSetups,
+            s.peerWhereKnown);
+        Feed(MakeSegment(token, 0, 3, 1, 0, 0, nullptr, 64), joiner); // 64 pads claimed, 1 held
+        Feed(MakeSegment(token, 0, 3, 1, 0, 0, nullptr, 65), joiner); // more than a packet may carry
+        CHECK(nt::Inspect().remoteInputs == before.remoteInputs, "%zu inputs from packets whose counts outrun them", nt::Inspect().remoteInputs);
+        std::vector<uint8_t> wrong = MakeSegment(token, 0, 3, 8);
+        wrong[0] ^= 1; // another game
+        Feed(wrong, joiner);
+        wrong = MakeSegment(token, 0, 3, 8);
+        wrong[8] ^= 1; // another version
+        Feed(wrong, joiner);
+        CHECK(nt::Inspect().remoteInputs == before.remoteInputs, "%zu inputs from another game's or version's packets", nt::Inspect().remoteInputs);
+        std::vector<uint8_t> garbage(proto::kReceiveBuffer);
+        uint32_t x = 12345;
+        for (int i = 0; i < 2000; i++)
+        {
+            for (uint8_t& byte : garbage)
+            {
+                x = x * 1664525u + 1013904223u;
+                byte = uint8_t(x >> 24);
+            }
+            memcpy(garbage.data(), &packets[i % packets.size()][0], 12); // the game and version right, the rest garbage
+            nt::Feed(garbage.data(), 12 + (x % (garbage.size() - 12)), joiner);
+        }
+        CHECK(nt::Inspect().state == nt::State::kConnected, "garbage ended the session");
+    }
+}
+
+int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // An indirect call to the address given, which ends the process (test_bad_indirect_calls).
+    if (argc == 3 && strcmp(argv[1], "--indirect-call") == 0)
+    {
+        if (!guest::Initialize())
+            return 2;
+        PPCContext ctx{};
+        uint8_t* base = guest::g_base;
+        const uint32_t target = uint32_t(strtoul(argv[2], nullptr, 16));
+        PPC_CALL_INDIRECT_FUNC(target);
+        return 0;
+    }
+
     RUN(test_heap_alloc_alignment_and_order);
     RUN(test_heap_range_and_exhaustion);
     RUN(test_heap_fixed_commit_release);
@@ -2103,6 +2531,8 @@ int main()
     RUN(test_critical_section_contention);
     RUN(test_pulse_and_spinlock);
     RUN(test_suspension);
+    RUN(test_function_lookup);
+    RUN(test_bad_indirect_calls);
     RUN(test_semaphores);
     RUN(test_hard_disk_partition);
     RUN(test_crypto);
@@ -2121,6 +2551,7 @@ int main()
     RUN(test_store_miss_preserves_registers);
     RUN(test_module_crt_exports);
     RUN(test_netplay_delays);
+    RUN(test_netplay_packets);
 
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures != 0;

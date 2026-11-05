@@ -16,10 +16,14 @@
 //   the game's threads write them, in the game's own code (GameState in netplay/game_state.h). Whose pages are whose is
 //   learned from the writes of the 60 frames before the save, which the write tracker (netplay/write_tracker.h)
 //   samples every millisecond as well as at frame boundaries and after each frame's update. The tracker also keeps
-//   each page's contents before its first write in the test. Of the image's pages that libraries or other threads
-//   write too, the savestate holds the bytes the game changed and others didn't in the first run, during which every
-//   write to them is single-stepped; other such pages ("mixed") are neither loaded nor compared, nor are the stacks
-//   below their stack pointers, the worker pools' stacks, or what the game lists as unchecked (timers).
+//   each page's contents before its first write in the test. The image's pages that libraries or other threads write
+//   too, as learned, are tracked by bytes in the first run, every write to them single-stepped, and the savestate holds
+//   the bytes the game's description of its memory gives it there (GameState::savedMemory, as the savestates saved at
+//   every frame hold them; on a page it doesn't describe, the bytes the game changed), but those others changed: not
+//   just the bytes the tracker saw the game change, since a write made while another thread's write to the page is
+//   single-stepped (the page writable meanwhile) goes unseen. Other such pages ("mixed": seen written by both only in
+//   the first run) are neither loaded nor compared, nor are the stacks below their stack pointers, the worker pools'
+//   stacks, or what the game lists as unchecked (timers).
 //   The image's pages' writers seen in earlier tests count as learned too.
 // - Host state: the game's suspended fibers' contexts, host stacks and registers (GameState::saveHost), which a load
 //   puts back wherever the fibers are suspended then; at each boundary of the replay their hashes are compared with the

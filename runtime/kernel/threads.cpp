@@ -406,7 +406,7 @@ namespace kernel
                 target = m_params.startAddress;
             }
 
-            PPCFunc* function = PPC_LOOKUP_FUNC(guest::g_base, target);
+            PPCFunc* function = guest::LookupFunction(target);
             if (!function)
             {
                 LOG_ERROR("Thread %u: start address 0x%08X isn't a known function", m_threadId, target);
@@ -517,7 +517,7 @@ namespace kernel
             if (i < 8)
                 registers[i++]->u64 = argument;
         }
-        PPCFunc* target = PPC_LOOKUP_FUNC(guest::g_base, function);
+        PPCFunc* target = guest::LookupFunction(function);
         if (!target)
         {
             LOG_ERROR("CallGuest: 0x%08X isn't a known function", function);
@@ -593,7 +593,7 @@ namespace kernel
                 PPCRegister* registers[] = { &context.r3, &context.r4, &context.r5, &context.r6, &context.r7, &context.r8, &context.r9, &context.r10 };
                 for (size_t i = 0; i < call.count; i++)
                     registers[i]->u64 = call.arguments[i];
-                PPCFunc* target = PPC_LOOKUP_FUNC(guest::g_base, call.function);
+                PPCFunc* target = guest::LookupFunction(call.function);
                 if (target)
                     target(context, guest::g_base);
                 else

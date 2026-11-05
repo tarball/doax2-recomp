@@ -63,6 +63,11 @@
 // build (a hash of the executable), the disc image's hash and the switches that change how the game runs (the session's
 // own, which a session always has on, the game heap, a sync test, the C runtime's FMA3 paths, and the debugging vblank
 // rate and file redirections). The host refuses another build, disc or switches, saying which in both machines' logs.
+// Who's who (netplay/protocol.h): the joining machine takes only the host's answer to its own hello, and the host takes a
+// machine as its player 2 only once the token its welcome carried comes back from that machine's address; from then on
+// each takes only the other's packets, from its address and port, with the token. A game without a game layer
+// (GameState::fightState and menuState) opens no socket. Nothing is encrypted or authenticated against a machine on the
+// path between the two (netplay/protocol.h).
 // At each fight's first frame both machines send its setup (GameState::fightSetup: the stage, characters and costumes,
 // the match's rules, the button layouts and the random number generators) until the other has it, and a fight that
 // isn't the same one names the parts that differ. At the first desync, both write their state at that frame

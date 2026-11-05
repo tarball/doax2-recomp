@@ -15,8 +15,10 @@
 #include "netplay/game_state.h"
 #include "netplay/heaps.h"
 #include "netplay/identity.h"
+#include "netplay/protocol.h"
 #include "netplay/replay.h"
 #include "netplay/savestates.h"
+#include "netplay/session_testing.h"
 #include "netplay/sync_test.h"
 #include "ui/notices.h"
 #include "ui/window.h"
@@ -52,9 +54,10 @@ namespace netplay::session
         using Clock = std::chrono::steady_clock;
         using std::chrono::microseconds;
 
-        constexpr uint16_t kVersion = 8;
-        constexpr uint32_t kMaxPads = 64;       // pads a segment packet carries at most
-        constexpr uint32_t kChecksumsSent = 8;  // the last checksums each segment packet carries
+        // The wire format, its types and bounds (protocol.h): the packets, the token, the frames a packet may name.
+        using namespace protocol;
+        static_assert(kShownBytes == netplay::kShownBytes);
+        static_assert(kSettingsSize == GameState::kMaxPlayerSettings);
         constexpr auto kHelloInterval = std::chrono::milliseconds(250);
         constexpr auto kAliveInterval = std::chrono::milliseconds(250);
         constexpr auto kResendInterval = std::chrono::milliseconds(8);
@@ -68,25 +71,19 @@ namespace netplay::session
         constexpr auto kLateFrame = microseconds(25000); // a frame boundary this long after the last: a vblank missed
         constexpr uint32_t kSlackFrames = 32;        // the frames a machine's slack is averaged over
         constexpr size_t kInboxLimit = 4096;         // packets received and not taken yet
-        constexpr int32_t kNoSlack = INT32_MIN;
         constexpr size_t kDesyncFrames = 128;        // the fight frames whose state is kept for a desync's dump
-        constexpr size_t kEndedKept = 8;             // the segments this machine has ended that it still answers for
-        constexpr size_t kEarlyKept = 64;            // the segments ahead whose packets are kept
-        // A segment's key: its number among the flow's segments the session played (the same on both machines), with
-        // kFightKey for a fight.
-        constexpr uint32_t kFightKey = 0x80000000;
-        constexpr uint32_t kNoKey = 0xFFFFFFFF;      // no segment
         constexpr uint32_t kGapPackets = 0xFFFFF;    // the pads' packet number's low bits between segments
-        constexpr uint32_t kFrameWindow = 1u << 24;  // a segment's frames a packet may name (inputs, checksums)
-        constexpr size_t kSettingsSize = GameState::kMaxPlayerSettings;
-        // A segment packet's `received` from a machine that has ended the segment: it needs nothing more of it, so the
-        // other doesn't answer (two machines that had both ended it would otherwise answer each other forever).
-        constexpr uint32_t kNothingNeeded = 0xFFFFFFFF;
+        // Answers to hellos (welcomes and refusals) a second at most: the joining machine sends 4 a second
+        // (kHelloInterval), and a hello's source can be forged (protocol.h), so the answers are what a flood of hellos
+        // could make this machine send to a third party: no more than the flood itself, a hello being no shorter than
+        // its answer, and at most this many. The hellos' log lines come once a second at most.
+        constexpr uint32_t kHelloAnswersPerSecond = 32;
+        constexpr auto kHelloLogInterval = std::chrono::seconds(1);
         // Rollback in fights (session.h): the input delay and the window (the most frames a machine runs past the last
-        // frame whose input from the other it has) unless NETPLAY_FIGHT_DELAY and NETPLAY_WINDOW say otherwise, and their
-        // bounds (the host's travel in its welcome).
-        constexpr uint32_t kDefaultFightDelay = 2, kMaxDelay = 30;
-        constexpr uint32_t kDefaultWindow = 8, kMaxWindow = 16;
+        // frame whose input from the other it has) unless NETPLAY_FIGHT_DELAY and NETPLAY_WINDOW say otherwise; their
+        // bounds (kMaxDelay, kMaxWindow) are the protocol's.
+        constexpr uint32_t kDefaultFightDelay = 2;
+        constexpr uint32_t kDefaultWindow = 8;
         // The time sync: a frame advantage below this isn't corrected (ms); the most a vblank is delayed by (us: an eighth
         // of a frame, so a frame's advantage takes 8 frames to even out); the most corrected at once (GGPO's 9 frames, ms);
         // and the frames after a correction before the next is decided, while both machines' slacks take it in (each
@@ -126,176 +123,6 @@ namespace netplay::session
         constexpr uint32_t kMaxMeasureMicroseconds = 1'000'000;
         constexpr uint32_t kMaxRoundTripMicroseconds = 10'000'000;
         constexpr int64_t kClockBucketSeconds = 5; // the two clocks' offsets, the least delayed packet's of each (DriftPpm)
-
-        enum class Type : uint16_t
-        {
-            kHello = 1,    // joining -> host: the joining player's input delay and its machine
-            kWelcome = 2,  // host -> joining: the session, its seed and input delay, the host's machine
-            kAlive = 3,    // where the sender's game is, every kAliveInterval once connected
-            kSegment = 4,  // a player's inputs, checksums and settings in a segment of the flow, and a fight's setup at first
-            kBye = 5,      // the sender leaves the session
-            kRefuse = 6,   // host -> joining: not the same build, disc or switches (with the host's machine)
-        };
-
-#pragma pack(push, 1)
-        struct Header
-        {
-            char game[8];      // GAME_PREFIX: another game's packets are ignored
-            uint16_t version;  // kVersion
-            uint16_t type;     // Type
-            uint32_t session;  // the host's session ID (0 in a Hello)
-            uint32_t time;     // the sender's clock as it sent this, in microseconds (wrapping)
-            uint32_t echo;     // the newest `time` the sender had from the receiver, plus how long it held it (0: none yet)
-        };
-        // What both machines must have alike to play together (identity.h), and for the log, what the machine is.
-        struct Identity
-        {
-            uint64_t build;         // identity::BuildId
-            uint64_t disc;          // identity::DiscHash
-            char configuration[16]; // the build's configuration
-            char switches[160];     // the switches that change how the game runs (Switches)
-            char machine[96];       // the CPU and Windows build, for the log
-        };
-        // A list of parts (the game's settings, a fight's setup: game_state.h), as compared between machines: each part's
-        // bytes, or a hash of them if longer than kShownBytes. The parts' names are the same on both machines (the same
-        // build), so they aren't sent.
-        constexpr uint32_t kMaxParts = 12;
-        constexpr uint8_t kHashed = 0xFF;
-        struct PartDigest
-        {
-            uint8_t length;               // the part's bytes, or kHashed: their hash in the first 8
-            uint8_t bytes[kShownBytes];
-        };
-        struct Digests
-        {
-            uint8_t count;
-            PartDigest parts[kMaxParts];
-        };
-        struct Hello
-        {
-            Header header;
-            uint16_t delay;
-            Identity identity;
-        };
-        // The host's input delays: fixed by its variables (kFixedLockstep, kFixedRollback), or chosen for each segment of
-        // the flow (Delays, in its packets). The window always applies.
-        constexpr uint8_t kFixedLockstep = 1, kFixedRollback = 2;
-        struct Welcome
-        {
-            Header header;
-            uint32_t seed;
-            uint16_t delay;      // the lockstep segments' input delay, if fixed
-            uint16_t fightDelay; // with rollback (session.h): the fights' input delay, if fixed
-            uint16_t window;     // and the window
-            uint8_t fixed;       // kFixedLockstep, kFixedRollback
-            Identity identity;
-        };
-        // A machine's measures of its own pace, in its segment and alive packets: the host chooses the input delays from
-        // both machines' (Choose), and each machine's log shows the other's. 0: not measured yet.
-        struct Measures
-        {
-            // Its main thread's work a frame (netplay::LastFrameWork), mean, in the flow's menu screens and in its fights (the
-            // frames run as the present).
-            uint32_t menuWorkUs, fightWorkUs;
-            uint32_t replayFrameUs; // in fights that roll back: a replayed frame's time, mean (a rollback's frames after its first)
-            uint32_t replayFrames;  // and how many were measured
-            uint32_t loadUs;        // a savestate's load, mean
-            uint32_t drawWaitUs;    // and its wait for the command processor to draw the frames recorded, mean
-        };
-        // How a delay was chosen.
-        enum class How : uint8_t
-        {
-            kDefault,   // nothing measured yet: a cautious default
-            kChosen,    // from the round trip and the machines' measures
-            kFixed,     // the host's variable (NETPLAY_DELAY, NETPLAY_FIGHT_DELAY)
-        };
-        // Where a machine's reckoning of the frames a rollback fits beside a frame came from (Fits).
-        enum class FitsFrom : uint8_t
-        {
-            kDefault,   // nothing measured: kDefaultFits
-            kFrameWork, // its frames' work, as an estimate of a replayed frame's
-            kReplays,   // its replayed frames
-        };
-        // The input delays of a segment of the flow, which the host chooses as it ends the segment before (the first
-        // segment's as it starts it, once connected): the host's packets carry its latest choice, and the joining machine
-        // plays the segment with them. A choice is final: both machines play the segment with it (session.h).
-        struct Delays
-        {
-            uint32_t segment = kNoKey;  // the segment's number among the flow's (Ordinal)
-            uint8_t lockstep = 0;       // its delay if it runs in lockstep (a menu screen, or a fight without rollback)
-            uint8_t rollback = 0;       // and if it's a fight that rolls back
-            uint8_t lockstepHow = 0, rollbackHow = 0; // How
-            // What they were chosen from: the delay 60 frames a second needs at the round trip in lockstep (without the
-            // frame to spare); the frames after which the other's input comes; the frames a rollback fits beside a frame on
-            // each machine, and where that came from (FitsFrom); the round trip (mean and 95th percentile) and the frames'
-            // work (the larger machine's, at least kLeastWorkMicroseconds).
-            uint8_t needed = 0, late = 0;
-            uint8_t fitsHost = 0, fitsJoining = 0, fitsHostFrom = 0, fitsJoiningFrom = 0;
-            uint32_t roundTripUs = 0, roundTripHighUs = 0, workUs = 0;
-        };
-        // What every segment and alive packet carries besides: the sender's measures, and from the host, its latest choice
-        // of delays.
-        struct Pace
-        {
-            Measures measures;
-            Delays delays;
-        };
-        struct Refuse
-        {
-            Header header;
-            Identity identity;
-        };
-        // Where the sender's game is: in a segment of the flow (and waiting there for the receiver's input), between
-        // the flow's segments, or on its own (outside the flow: its own menus and modes, booting), and the flow's segment
-        // it's in or was last in, with its frame there (its last, once it has left it).
-        enum class Where : uint8_t
-        {
-            kOwnTime,
-            kBetween,
-            kInSegment,
-            kWaiting,
-        };
-        struct Alive
-        {
-            Header header;
-            uint32_t key;    // the segment (SegmentPacket::key), or kNoKey
-            uint32_t frame;  // its frame
-            uint32_t screen; // a menu screen's identity
-            uint8_t where;   // Where
-            Pace pace;
-        };
-        struct Bye
-        {
-            Header header;
-            uint8_t reason; // Leaving
-        };
-        // Followed by `pads` pads (the segment's frames `first` on), `checksums` checksums, and with kSetupIncluded the
-        // fight's setup at its first frame (Digests).
-        constexpr uint8_t kSetupIncluded = 1, kSetupReceived = 2;
-        struct SegmentPacket
-        {
-            Header header;
-            uint32_t key;       // the segment: its number in the flow's (both machines'), with kFightKey for a fight
-            uint32_t screen;    // which menu screen it is on the sender (GameState::MenuState), 0 in a fight
-            uint32_t received;  // the sender has the receiver's inputs of the segment for every frame before this one
-            uint32_t first;
-            uint16_t pads;
-            uint16_t checksums;
-            int32_t slack;      // the sender's slack in a fight (LocalSlack), in microseconds, or kNoSlack
-            uint8_t setup;      // kSetupIncluded: the sender's fight setup follows; kSetupReceived: the sender has the receiver's
-            uint8_t delay;      // the input delay the sender plays the segment with
-            // The sender's player's settings for the flow (GameState::PlayerSettings), as it entered the flow: `size`
-            // bytes, 0 if none.
-            uint8_t settingsSize;
-            uint8_t settings[kSettingsSize];
-            Pace pace;
-        };
-        struct Checksum
-        {
-            uint32_t frame;
-            uint64_t checksum;
-        };
-#pragma pack(pop)
 
         enum class State
         {
@@ -457,12 +284,24 @@ namespace netplay::session
 
         struct Session
         {
-            State state = State::kOff;
+            std::atomic<State> state{ State::kOff }; // (the alive thread and Shutdown read it)
             bool host = false;
             SOCKET socket = INVALID_SOCKET;
             sockaddr_in peer{};
             std::string peerName;
-            uint32_t id = 0, seed = 0, delay = 3;
+            // The session's token (protocol.h): the host's for the other machine's address, which its welcome carries,
+            // and the joining machine's from that welcome; the host's secret the tokens are made from (TokenFor); and the
+            // joining machine's nonce, which the host's answer must echo.
+            uint64_t token = 0;
+            uint8_t secret[16] = {};
+            uint64_t nonce = 0;
+            // The host's answers to hellos this second (kHelloAnswersPerSecond), and when a hello was last logged.
+            Clock::time_point helloAnswersSecond{};
+            uint32_t helloAnswers = 0;
+            Clock::time_point helloLogged{};
+            // For the tests (session_testing.h): the packets this session would have sent without a socket, by kind.
+            uint64_t testSent = 0, testWelcomes = 0, testRefusals = 0;
+            uint32_t seed = 0, delay = 3;
             // Rollback in fights (session.h): the fights' input delay and the window, the host's.
             bool rollback = false;
             uint32_t fightDelay = kDefaultFightDelay, window = kDefaultWindow;
@@ -543,7 +382,6 @@ namespace netplay::session
             // This machine's identity, once the disc image's hash is known, and the other's refusal, logged once.
             bool identityKnown = false;
             Identity identity{};
-            std::string refused;
             // The current fight's setup at its first frame here, the other machine's (by the fight's key: of fights this
             // one may not be in yet), whether the other has this one's, and whether they've been compared.
             bool localSetupKnown = false, peerHasSetup = false, setupCompared = false, setupsDiffer = false;
@@ -594,6 +432,10 @@ namespace netplay::session
             std::mutex mutex;
             std::vector<Packet> packets;
             HANDLE arrived = nullptr; // set as a packet arrives
+            // The other machine's address and port (PackAddress) once the session has one, or 0: the receiving thread
+            // drops every other machine's datagrams before they reach the main thread (the joining machine's host from
+            // the start, the host's peer once connected).
+            std::atomic<uint64_t> peerFilter{ 0 };
         };
         Inbox& g_inbox = *new Inbox;
 
@@ -614,6 +456,11 @@ namespace netplay::session
             uint32_t peerTime = 0;
             std::chrono::steady_clock::time_point peerTimeArrival{};
             Pace pace{};
+            // Whom to send to, and with which token (the main thread sets them as the session connects: Connected).
+            bool connected = false;
+            uint64_t token = 0;
+            sockaddr_in peer{};
+            SOCKET socket = INVALID_SOCKET;
         };
         AliveShared& g_alive = *new AliveShared;
 
@@ -881,6 +728,12 @@ namespace netplay::session
             }
         }
 
+        // A machine's address and port as one word (Inbox::peerFilter): never 0 for a real address.
+        uint64_t PackAddress(const sockaddr_in& address)
+        {
+            return (uint64_t(1) << 48) | (uint64_t(ntohl(address.sin_addr.s_addr)) << 16) | ntohs(address.sin_port);
+        }
+
         // The receiving thread: times each packet as it arrives.
         void ReceiveThread()
         {
@@ -898,6 +751,9 @@ namespace netplay::session
                     Sleep(1); // a packet too long, or the like
                     continue;
                 }
+                // Another machine's than the one this session is with: dropped here (Inbox::peerFilter).
+                if (const uint64_t peer = g_inbox.peerFilter.load(); peer != 0 && peer != PackAddress(from))
+                    continue;
                 {
                     // While the main thread doesn't take them (a long stall), as many as a socket's buffer would hold.
                     std::lock_guard lock(g_inbox.mutex);
@@ -916,14 +772,63 @@ namespace netplay::session
             return std::string(text) + ":" + std::to_string(ntohs(address.sin_port));
         }
 
-        void FillHeader(Header& header, Type type)
+        bool SameAddress(const sockaddr_in& a, const sockaddr_in& b)
+        {
+            return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+        }
+
+        // The host's token for a machine at this address and port (protocol.h): SipHash-2-4 of them with the session's
+        // secret, never 0. Stateless: a hello from anywhere gets the token for its source in the welcome, and a packet
+        // from an address with that address's token shows the welcome reached it.
+        uint64_t TokenFor(const sockaddr_in& address)
+        {
+            uint8_t message[6];
+            memcpy(message, &address.sin_addr.s_addr, 4);
+            memcpy(message + 4, &address.sin_port, 2);
+            return SipHash24(g_session.secret, message, sizeof(message)) | 1;
+        }
+
+        // Whether the host may answer a hello now: kHelloAnswersPerSecond at most.
+        bool MayAnswerHello(Clock::time_point now)
+        {
+            Session& s = g_session;
+            if (now - s.helloAnswersSecond >= std::chrono::seconds(1))
+            {
+                s.helloAnswersSecond = now;
+                s.helloAnswers = 0;
+            }
+            return s.helloAnswers++ < kHelloAnswersPerSecond;
+        }
+
+        // The session has its other machine: the host's, whose token came back from it, or the joining machine's host,
+        // whose welcome answered its hello. From now on only its packets, with the token, are taken (Receive, and the
+        // receiving thread's filter), and the alive thread sends to it.
+        void Connected(const sockaddr_in& peer, uint64_t token, Clock::time_point arrival)
+        {
+            Session& s = g_session;
+            s.peer = peer;
+            s.peerName = Describe(peer);
+            s.token = token;
+            s.lastArrival = arrival;
+            s.state = State::kConnected;
+            g_inbox.peerFilter.store(PackAddress(peer));
+            std::lock_guard lock(g_alive.mutex);
+            g_alive.connected = true;
+            g_alive.token = token;
+            g_alive.peer = peer;
+            g_alive.socket = s.socket;
+        }
+
+        // A packet's header, with the session's token unless another is given (a welcome's, the token for its receiver's
+        // address; a hello's 0).
+        void FillHeader(Header& header, Type type, uint64_t token = g_session.token)
         {
             const Session& s = g_session;
             memset(header.game, 0, sizeof(header.game));
             strncpy(header.game, GAME_PREFIX, sizeof(header.game));
             header.version = kVersion;
             header.type = uint16_t(type);
-            header.session = s.id;
+            header.session = token;
             const Clock::time_point now = Clock::now();
             header.time = Microseconds(now);
             header.echo = 0;
@@ -1067,25 +972,37 @@ namespace netplay::session
             return result;
         }
 
-        // Sends a packet to the other machine (under the simulated conditions, if any). `counted`: in the statistics.
+        // Sends a packet to `to` through `socket` (under the simulated conditions, if any), from any thread. Without a
+        // socket (the tests), it's counted and not sent. Returns false if the conditions dropped it.
+        bool SendTo(SOCKET socket, const sockaddr_in& to, const void* data, size_t length)
+        {
+            if (to.sin_port == 0)
+                return true;
+            bool held = false;
+            if (Dropped(data, length, to, held))
+                return false;
+            if (held)
+                return true;
+            if (socket == INVALID_SOCKET)
+                g_session.testSent++;
+            else
+                sendto(socket, static_cast<const char*>(data), int(length), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+            return true;
+        }
+
+        // Sends a packet to the other machine (main thread). `counted`: in the statistics.
         void Send(const void* data, size_t length, bool counted = true)
         {
             Session& s = g_session;
-            if (s.socket == INVALID_SOCKET || s.peer.sin_port == 0)
+            if (s.peer.sin_port == 0)
                 return;
             if (counted)
             {
                 s.statistics.packetsSent++;
                 s.statistics.bytesSent += length;
             }
-            bool held = false;
-            if (Dropped(data, length, s.peer, held))
-            {
-                if (counted)
-                    s.statistics.dropped++;
-            }
-            else if (!held)
-                sendto(s.socket, static_cast<const char*>(data), int(length), 0, reinterpret_cast<const sockaddr*>(&s.peer), sizeof(s.peer));
+            if (!SendTo(s.socket, s.peer, data, length) && counted)
+                s.statistics.dropped++;
         }
 
         // The alive thread: once connected, tells the other machine where this one's game is every kAliveInterval,
@@ -1095,23 +1012,30 @@ namespace netplay::session
             for (;;)
             {
                 Sleep(DWORD(std::chrono::duration_cast<std::chrono::milliseconds>(kAliveInterval).count()));
-                const Session& s = g_session;
-                if (s.state == State::kEnded)
+                const State state = g_session.state;
+                if (state == State::kEnded)
                     return;
-                if (s.state != State::kConnected)
+                if (state != State::kConnected)
                     continue;
                 Alive packet{};
                 memset(packet.header.game, 0, sizeof(packet.header.game));
                 strncpy(packet.header.game, GAME_PREFIX, sizeof(packet.header.game));
                 packet.header.version = kVersion;
                 packet.header.type = uint16_t(Type::kAlive);
-                packet.header.session = s.id;
                 const Clock::time_point now = Clock::now();
                 packet.header.time = Microseconds(now);
+                sockaddr_in peer{};
+                SOCKET socket = INVALID_SOCKET;
                 {
-                    // The echo of the other's clock (FillHeader's), so that the round trip is measured while no segment
-                    // runs (the handshake on), and this machine's pace.
+                    // Whom to send to and the token (the main thread's, as the session connected), the echo of the other's
+                    // clock (FillHeader's), so that the round trip is measured while no segment runs (the handshake on),
+                    // and this machine's pace.
                     std::lock_guard lock(g_alive.mutex);
+                    if (!g_alive.connected)
+                        continue;
+                    packet.header.session = g_alive.token;
+                    peer = g_alive.peer;
+                    socket = g_alive.socket;
                     if (g_alive.peerTimeKnown)
                         packet.header.echo = std::max<uint32_t>(1, g_alive.peerTime + uint32_t(MicrosecondsBetween(g_alive.peerTimeArrival, now)));
                     packet.pace = g_alive.pace;
@@ -1120,7 +1044,7 @@ namespace netplay::session
                 packet.frame = g_where.frame.load();
                 packet.screen = g_where.screen.load();
                 packet.where = g_where.where.load();
-                Send(&packet, sizeof(packet), false);
+                SendTo(socket, peer, &packet, sizeof(packet));
             }
         }
 
@@ -1225,9 +1149,17 @@ namespace netplay::session
             memcpy(destination, text.data(), std::min(text.size(), size - 1));
         }
 
+        // A text field of a packet, for the log: to its length or its first 0, and printable ASCII only (the rest '?'), so
+        // that nothing the other machine put in it reaches the log as it is.
         std::string Text(const char* field, size_t size)
         {
-            return std::string(field, strnlen(field, size));
+            std::string text(field, strnlen(field, size));
+            for (char& c : text)
+            {
+                if (uint8_t(c) < 0x20 || uint8_t(c) > 0x7E)
+                    c = '?';
+            }
+            return text;
         }
 
         // This machine's identity, once the disc image's hash is known.
@@ -1896,22 +1828,31 @@ namespace netplay::session
             Apart(why);
         }
 
-        // Why a machine leaves the session (Bye::reason).
-        enum class Leaving : uint8_t
-        {
-            kLeaves,    // its player leaves (the window closes), or the session ended there otherwise
-            kApart,     // the two games went separate ways in the flow
-        };
-
+        // From any thread (Shutdown runs on the window's): to the other machine, with the token, as the session connected
+        // (AliveShared), without the echo.
         void SendBye(Leaving reason)
         {
-            Session& s = g_session;
-            Bye bye;
-            FillHeader(bye.header, Type::kBye);
+            Bye bye{};
+            sockaddr_in peer{};
+            SOCKET socket = INVALID_SOCKET;
+            {
+                std::lock_guard lock(g_alive.mutex);
+                if (!g_alive.connected)
+                    return;
+                peer = g_alive.peer;
+                socket = g_alive.socket;
+                bye.header.session = g_alive.token;
+            }
+            strncpy(bye.header.game, GAME_PREFIX, sizeof(bye.header.game));
+            bye.header.version = kVersion;
+            bye.header.type = uint16_t(Type::kBye);
+            bye.header.time = Microseconds(Clock::now());
             bye.reason = uint8_t(reason);
+            if (socket == INVALID_SOCKET)
+                return;
             // Sent a few times, directly: it may be the last thing this machine sends.
             for (int i = 0; i < 3; i++)
-                sendto(s.socket, reinterpret_cast<const char*>(&bye), sizeof(bye), 0, reinterpret_cast<const sockaddr*>(&s.peer), sizeof(s.peer));
+                sendto(socket, reinterpret_cast<const char*>(&bye), sizeof(bye), 0, reinterpret_cast<const sockaddr*>(&peer), sizeof(peer));
         }
 
         void End(const char* why, Leaving reason = Leaving::kLeaves)
@@ -1971,10 +1912,17 @@ namespace netplay::session
                         SendSegment(ended.key, ended.screen, ended.delay, ended.local, ended.checksums, packet.received, kNothingNeeded, kNoSlack);
                     return;
                 }
-                // A segment this machine has played and forgotten.
-                if (Ordinal(packet.key) < s.segmentsStarted)
+                // A segment this machine has played and forgotten, or one further ahead than the other machine can be (it
+                // can't pass a segment's frame `delay` without this machine's input).
+                if (Ordinal(packet.key) < s.segmentsStarted || Ordinal(packet.key) >= s.segmentsStarted + kEarlyKept)
                     return;
             }
+            // The frames the packet's inputs and checksums may name (protocol.h, kFramesAhead): so far past this machine's
+            // frame of the segment at most, or past a segment's start if this machine isn't in it yet, which bounds what
+            // it keeps of the other's.
+            const uint32_t ahead = (current ? step.lastFrame : 0) + kFramesAhead;
+            if (packet.first + packet.pads > ahead)
+                return;
             // The other player's settings for the flow, as they entered it.
             Settings settings;
             if (!ReadSettings(packet, settings))
@@ -2053,14 +2001,17 @@ namespace netplay::session
             {
                 Checksum checksum;
                 memcpy(&checksum, cursor, sizeof(checksum));
-                if (checksum.frame >= kFrameWindow)
+                if (checksum.frame >= ahead)
                     continue;
                 if (checksums.emplace(checksum.frame, checksum.checksum).second && current)
                     CompareChecksum(checksum.frame);
             }
             if (current)
             {
-                step.peerReceived = std::max(step.peerReceived, packet.received);
+                // What the other machine has of this one's inputs, within what this one has made (to its frame + delay):
+                // a `received` past that (kNothingNeeded from a machine that has ended the segment first, or a hostile
+                // one's) would have it forget inputs it still needs (Forget).
+                step.peerReceived = std::max(step.peerReceived, std::min(packet.received, step.lastFrame + step.delay + 1));
                 // (With rollback, kNoSlack too: the other machine started its slack afresh after a long wait, and the
                 // time sync waits for it.)
                 if (packet.slack != kNoSlack || (s.rollback && step.fight))
@@ -2126,6 +2077,13 @@ namespace netplay::session
             memcpy(game, header.game, sizeof(header.game));
             if (strcmp(game, GAME_PREFIX) != 0)
                 return;
+            const State state = s.state;
+            if (state == State::kOff || state == State::kEnded)
+                return;
+            // The other machine's packets alone: the joining machine's host from the start, the host's peer once connected
+            // (the receiving thread drops the rest too, Inbox::peerFilter). Before that, the host takes hellos from anyone.
+            if ((!s.host || state == State::kConnected) && !SameAddress(from, s.peer))
+                return;
             if (header.version != kVersion)
             {
                 static bool logged = false;
@@ -2137,61 +2095,68 @@ namespace netplay::session
                 }
                 return;
             }
-            if (Type(header.type) != Type::kAlive)
+            const Type type = Type(header.type);
+            if (type != Type::kAlive)
                 s.statistics.packetsReceived++; // (as the packets sent count, the alive thread's aren't)
-            switch (Type(header.type))
+            switch (type)
             {
             case Type::kHello:
             {
-                // Answered once this machine knows its identity (the disc image's hash may still be being computed): the
-                // joining one sends hellos until then.
-                if (!s.host || length < int(sizeof(Hello)) || !LocalIdentity())
+                // The host's answer, echoing the hello's nonce: a welcome with the token for the sender's address
+                // (TokenFor), or for another build, disc or switches a refusal with this machine's identity, so the other
+                // can say why too. Answered once this machine knows its identity (the disc image's hash may still be being
+                // computed: the joining one sends hellos until then), and kHelloAnswersPerSecond at most, since a hello's
+                // source may be spoofed. The sender becomes the peer only as the token comes back from it (below). Once
+                // connected, the peer's hellos (it may have missed the welcome) get the welcome again, nobody else's
+                // anything.
+                if (!s.host || length < int(sizeof(Hello)) || !LocalIdentity() || !MayAnswerHello(arrival))
                     return;
                 Hello hello;
                 memcpy(&hello, data, sizeof(hello));
-                const bool known = s.state == State::kConnected && from.sin_addr.s_addr == s.peer.sin_addr.s_addr && from.sin_port == s.peer.sin_port;
-                if (s.state == State::kConnecting)
+                const bool log = arrival - s.helloLogged >= kHelloLogInterval;
+                if (log)
+                    s.helloLogged = arrival;
+                if (state == State::kConnecting)
                 {
-                    // Another build, disc or switches: refused, with this machine's identity, so the other can say why too.
                     if (const std::string why = Mismatch(hello.identity); !why.empty())
                     {
-                        if (why != s.refused)
+                        if (log)
                             LOG_ERROR("Netplay: refusing the player at %s (%s): %s", Describe(from).c_str(),
                                 Text(hello.identity.machine, sizeof(hello.identity.machine)).c_str(), why.c_str());
-                        s.refused = why;
-                        Refuse refuse;
-                        FillHeader(refuse.header, Type::kRefuse);
+                        Refuse refuse{};
+                        FillHeader(refuse.header, Type::kRefuse, 0);
+                        refuse.nonce = hello.nonce;
                         refuse.identity = s.identity;
-                        sendto(s.socket, reinterpret_cast<const char*>(&refuse), sizeof(refuse), 0, reinterpret_cast<const sockaddr*>(&from), sizeof(from));
+                        s.testRefusals++;
+                        SendTo(s.socket, from, &refuse, sizeof(refuse));
                         return;
                     }
-                    s.peer = from;
-                    s.peerName = Describe(from);
-                    s.state = State::kConnected;
-                    s.lastArrival = arrival;
-                    LOG_INFO("Netplay: player 2 at %s (%s); %s, seed %u%s", s.peerName.c_str(),
-                        Text(hello.identity.machine, sizeof(hello.identity.machine)).c_str(), DelayText().c_str(), s.seed, RollbackText().c_str());
+                    if (log)
+                        LOG_INFO("Netplay: welcoming the player at %s (%s), who joins as its first packet with the session's token comes",
+                            Describe(from).c_str(), Text(hello.identity.machine, sizeof(hello.identity.machine)).c_str());
                 }
-                else if (!known)
-                    return;
-                NoteTimes(header, arrival);
-                Welcome welcome;
-                FillHeader(welcome.header, Type::kWelcome);
+                Welcome welcome{};
+                FillHeader(welcome.header, Type::kWelcome, state == State::kConnected ? s.token : TokenFor(from));
+                welcome.nonce = hello.nonce;
                 welcome.seed = s.seed;
                 welcome.delay = uint16_t(s.delay);
                 welcome.fightDelay = uint16_t(s.fightDelay);
                 welcome.window = uint16_t(s.window);
                 welcome.fixed = uint8_t((s.lockstepFixed ? kFixedLockstep : 0) | (s.rollbackFixed ? kFixedRollback : 0));
                 welcome.identity = s.identity;
-                Send(&welcome, sizeof(welcome));
+                s.testWelcomes++;
+                SendTo(s.socket, from, &welcome, sizeof(welcome));
                 return;
             }
             case Type::kWelcome:
             {
-                if (s.host || length < int(sizeof(Welcome)) || s.state != State::kConnecting || !LocalIdentity())
+                // The host's answer to this machine's hello (its nonce), from the host (checked above).
+                if (s.host || length < int(sizeof(Welcome)) || state != State::kConnecting || !LocalIdentity())
                     return;
                 Welcome welcome;
                 memcpy(&welcome, data, sizeof(welcome));
+                if (welcome.nonce != s.nonce || welcome.header.session == 0)
+                    return;
                 if (const std::string why = Mismatch(welcome.identity); !why.empty())
                 {
                     LOG_ERROR("Netplay: the host at %s (%s) can't play with this machine: %s", s.peerName.c_str(),
@@ -2199,11 +2164,9 @@ namespace netplay::session
                     End("the host's game isn't the same");
                     return;
                 }
-                s.id = welcome.header.session;
                 s.seed = welcome.seed;
                 AdoptDelay(welcome.delay, welcome.fightDelay, welcome.window, welcome.fixed);
-                s.state = State::kConnected;
-                s.lastArrival = arrival;
+                Connected(from, welcome.header.session, arrival);
                 NoteTimes(header, arrival);
                 LOG_INFO("Netplay: joined %s (%s) as player 2; %s, seed %u%s", s.peerName.c_str(),
                     Text(welcome.identity.machine, sizeof(welcome.identity.machine)).c_str(), DelayText().c_str(), s.seed, RollbackText().c_str());
@@ -2211,10 +2174,12 @@ namespace netplay::session
             }
             case Type::kRefuse:
             {
-                if (s.host || length < int(sizeof(Refuse)) || s.state != State::kConnecting || !LocalIdentity())
+                if (s.host || length < int(sizeof(Refuse)) || state != State::kConnecting || !LocalIdentity())
                     return;
                 Refuse refuse;
                 memcpy(&refuse, data, sizeof(refuse));
+                if (refuse.nonce != s.nonce)
+                    return;
                 const std::string why = Mismatch(refuse.identity);
                 LOG_ERROR("Netplay: the host at %s (%s) refused to play with this machine: %s", s.peerName.c_str(),
                     Text(refuse.identity.machine, sizeof(refuse.identity.machine)).c_str(),
@@ -2225,29 +2190,46 @@ namespace netplay::session
             default:
                 break;
             }
-            if (s.state != State::kConnected || header.session != s.id)
+            // The rest carry the session's token. The host, still connecting, takes as its peer the machine whose hello it
+            // answered, as the first packet with its address's token comes back from it (protocol.h): a welcome sent to a
+            // spoofed address never does.
+            if (state == State::kConnecting)
+            {
+                if (!s.host || header.session != TokenFor(from))
+                    return;
+                Connected(from, header.session, arrival);
+                LOG_INFO("Netplay: player 2 at %s; %s, seed %u%s", s.peerName.c_str(), DelayText().c_str(), s.seed, RollbackText().c_str());
+            }
+            else if (header.session != s.token)
                 return;
             s.lastArrival = std::max(s.lastArrival, arrival);
-            switch (Type(header.type))
+            switch (type)
             {
             case Type::kAlive:
+            {
                 if (length < int(sizeof(Alive)))
                     return;
-                memcpy(&s.peerWhere, data, sizeof(Alive));
+                Alive alive;
+                memcpy(&alive, data, sizeof(alive));
+                if (alive.where > uint8_t(Where::kWaiting))
+                    return;
+                s.peerWhere = alive;
                 s.peerWhereKnown = true;
                 s.peerWhereArrival = arrival;
                 NoteTimes(header, arrival);
-                NotePace(s.peerWhere.pace);
+                NotePace(alive.pace);
                 return;
+            }
             case Type::kSegment:
                 NoteTimes(header, arrival);
                 ReceiveSegment(data, length, arrival);
                 return;
             case Type::kBye:
             {
-                Bye bye{};
-                if (length >= int(sizeof(Bye)))
-                    memcpy(&bye, data, sizeof(bye));
+                if (length < int(sizeof(Bye)))
+                    return;
+                Bye bye;
+                memcpy(&bye, data, sizeof(bye));
                 if (Leaving(bye.reason) == Leaving::kApart)
                 {
                     LOG_WARN("Netplay: the other machine found the two games out of step in the flow");
@@ -2266,6 +2248,7 @@ namespace netplay::session
                 return;
             }
         }
+
 
         void ReceiveAll()
         {
@@ -2292,9 +2275,9 @@ namespace netplay::session
             Session& s = g_session;
             if (s.state != State::kConnecting || s.host || Clock::now() - s.lastHello < kHelloInterval || !LocalIdentity())
                 return;
-            Hello hello;
-            FillHeader(hello.header, Type::kHello);
-            hello.delay = uint16_t(s.delay);
+            Hello hello{};
+            FillHeader(hello.header, Type::kHello, 0);
+            hello.nonce = s.nonce;
             hello.identity = s.identity;
             Send(&hello, sizeof(hello));
             s.lastHello = Clock::now();
@@ -2332,6 +2315,15 @@ namespace netplay::session
             if (const char* window = std::getenv(GAME_PREFIX "_NETPLAY_WINDOW"))
                 s.window = std::clamp<uint32_t>(uint32_t(strtoul(window, nullptr, 10)), 1, kMaxWindow);
             s.state = State::kEnded;
+            // A session plays the game's multiplayer flow, which the game's layer describes (GameState::fightState and
+            // menuState): a game without one has no netplay, and opens no socket (what Configured() switches elsewhere still
+            // applies: no achievements, the C runtime's software math, controllers 3 and 4 disconnected).
+            if (const GameState* game = GetGameState(); !game || !game->fightState || !game->menuState)
+            {
+                LOG_ERROR("Netplay: this game has no netplay (no game layer registers its state): no session starts");
+                s.endReason = "this game has no netplay";
+                return;
+            }
             WSADATA data;
             if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
             {
@@ -2347,12 +2339,18 @@ namespace netplay::session
             sockaddr_in local{};
             local.sin_family = AF_INET;
             local.sin_addr.s_addr = htonl(INADDR_ANY);
+            // The host's secret for its tokens, its seed, and the joining machine's nonce (protocol.h): from the system's
+            // random numbers (std::random_device is Windows' here).
+            std::random_device random;
             if (setting.rfind("host:", 0) == 0)
             {
                 s.host = true;
                 local.sin_port = htons(uint16_t(strtoul(setting.c_str() + 5, nullptr, 10)));
-                std::random_device random;
-                s.id = random() | 1;
+                for (size_t i = 0; i < sizeof(s.secret); i += 4)
+                {
+                    const uint32_t word = random();
+                    memcpy(s.secret + i, &word, 4);
+                }
                 s.seed = random();
                 if (const char* seed = std::getenv(GAME_PREFIX "_FIGHT_SEED"))
                     s.seed = uint32_t(strtoul(seed, nullptr, 0));
@@ -2362,14 +2360,17 @@ namespace netplay::session
                 const std::string target = setting.substr(5);
                 const size_t colon = target.rfind(':');
                 s.peer.sin_family = AF_INET;
-                s.peer.sin_port = htons(uint16_t(strtoul(target.c_str() + colon + 1, nullptr, 10)));
                 if (colon == std::string::npos || inet_pton(AF_INET, target.substr(0, colon).c_str(), &s.peer.sin_addr) != 1)
                 {
                     LOG_ERROR("Netplay: NETPLAY=join:<address>:<port> needs an IPv4 address, not \"%s\"", target.c_str());
                     s.endReason = "NETPLAY's address isn't right";
                     return;
                 }
+                s.peer.sin_port = htons(uint16_t(strtoul(target.c_str() + colon + 1, nullptr, 10)));
                 s.peerName = Describe(s.peer);
+                s.nonce = uint64_t(random()) << 32 | random();
+                // Only the host's datagrams, from the start (ReceiveThread).
+                g_inbox.peerFilter.store(PackAddress(s.peer));
             }
             else
             {
@@ -3257,18 +3258,21 @@ namespace netplay::session
             s.lastPads[1] = pads[1];
         }
 
-        // What both machines have: the inputs before the frame both have passed (`keep`: the first this machine may still
-        // need, with rollback the first not final), and the checksums 256 frames before `f`.
+        // What's no longer needed: the other player's inputs before those this machine may still need (`keep`: with
+        // rollback the first frame not final) and before those it has in a row (Received); this machine's own before
+        // those the other has (peerReceived) and `keep`, and whatever the other says it has, those more than 1024 frames
+        // before `f` (a machine that never acknowledged would otherwise have this one keep the whole segment's); and the
+        // checksums 256 frames before `f`. With what a packet may name (kFramesAhead), that bounds what a segment keeps.
         void Forget(uint32_t keep, uint32_t f)
         {
             Session& s = g_session;
             Lockstep& step = s.step;
-            const uint32_t settled = std::min({ step.peerReceived, Received(), keep });
-            if (settled > 64)
-            {
-                step.local.erase(step.local.begin(), step.local.lower_bound(settled - 64));
+            if (const uint32_t settled = std::min(Received(), keep); settled > 64)
                 step.remote.erase(step.remote.begin(), step.remote.lower_bound(settled - 64));
-            }
+            if (const uint32_t settled = std::min(step.peerReceived, keep); settled > 64)
+                step.local.erase(step.local.begin(), step.local.lower_bound(settled - 64));
+            if (f > 1024)
+                step.local.erase(step.local.begin(), step.local.lower_bound(f - 1024));
             if (f > 256)
             {
                 step.localChecksums.erase(step.localChecksums.begin(), step.localChecksums.lower_bound(f - 256));
@@ -3958,7 +3962,7 @@ namespace netplay::session
         const Session& s = g_session;
         if (s.state == State::kConnected || s.state == State::kEnded)
         {
-            if (s.host || s.id != 0)
+            if (s.host || s.token != 0)
                 return s.seed;
         }
         return std::nullopt;
@@ -3972,5 +3976,152 @@ namespace netplay::session
         LOG_INFO("Netplay: leaving the session");
         SendBye(Leaving::kLeaves);
         s.state = State::kEnded;
+    }
+
+    namespace testing
+    {
+        namespace
+        {
+            sockaddr_in ToSockaddr(Address address)
+            {
+                sockaddr_in result{};
+                result.sin_family = AF_INET;
+                result.sin_addr.s_addr = htonl(address.ip);
+                result.sin_port = htons(address.port);
+                return result;
+            }
+
+            Address FromSockaddr(const sockaddr_in& address)
+            {
+                return { ntohl(address.sin_addr.s_addr), ntohs(address.sin_port) };
+            }
+        }
+
+        void Reset(Role role, Address peer)
+        {
+            // The session afresh (no socket, no threads), and what the threads would share.
+            g_session.~Session();
+            new (&g_session) Session();
+            Session& s = g_session;
+            g_inbox.peerFilter.store(0);
+            {
+                std::lock_guard lock(g_alive.mutex);
+                g_alive.peerTimeKnown = false;
+                g_alive.pace = Pace{};
+                g_alive.connected = false;
+                g_alive.token = 0;
+                g_alive.peer = sockaddr_in{};
+                g_alive.socket = INVALID_SOCKET;
+            }
+            s.host = role == Role::kHost;
+            s.rollback = false;
+            std::random_device random;
+            for (size_t i = 0; i < sizeof(s.secret); i += 4)
+            {
+                const uint32_t word = random();
+                memcpy(s.secret + i, &word, 4);
+            }
+            s.seed = random();
+            if (!s.host)
+            {
+                s.peer = ToSockaddr(peer);
+                s.peerName = Describe(s.peer);
+                s.nonce = uint64_t(random()) << 32 | random();
+                g_inbox.peerFilter.store(PackAddress(s.peer));
+            }
+            // Its identity, without the disc image's hash (none here).
+            Identity& id = s.identity;
+            id = Identity{};
+            id.build = identity::BuildId();
+            id.disc = 0;
+            CopyText(id.configuration, sizeof(id.configuration), identity::BuildConfiguration());
+            CopyText(id.switches, sizeof(id.switches), Switches());
+            CopyText(id.machine, sizeof(id.machine), identity::Machine());
+            s.identityKnown = true;
+            s.state = netplay::session::State::kConnecting;
+        }
+
+        void Connect(Address peer, uint64_t token)
+        {
+            Connected(ToSockaddr(peer), token, Clock::now());
+        }
+
+        void StartSegment(bool fight, uint32_t delay, uint32_t frame)
+        {
+            Session& s = g_session;
+            Lockstep& step = s.step;
+            step = Lockstep{};
+            step.active = true;
+            step.ordinal = s.segmentsStarted++;
+            step.key = fight ? kFightKey | step.ordinal : step.ordinal;
+            step.screen = fight ? 0 : 0x301;
+            step.fight = fight;
+            step.delay = std::min(delay, kMaxDelay);
+            step.delayKnown = true;
+            step.lastFrame = frame;
+            s.flow = true;
+        }
+
+        void AdvanceFrame()
+        {
+            Lockstep& step = g_session.step;
+            if (!step.active)
+                return;
+            step.lastFrame++;
+            step.local[step.lastFrame + step.delay] = Pad{};
+            Forget(UINT32_MAX, step.lastFrame);
+        }
+
+        void Feed(const void* data, size_t length, Address from)
+        {
+            netplay::session::Receive(static_cast<const uint8_t*>(data), int(std::min(length, kReceiveBuffer)), ToSockaddr(from), Clock::now());
+        }
+
+        void LocalIdentityBytes(void* identity, size_t size)
+        {
+            if (size == sizeof(Identity))
+                memcpy(identity, &g_session.identity, sizeof(Identity));
+        }
+
+        uint64_t HostToken(Address from)
+        {
+            return TokenFor(ToSockaddr(from));
+        }
+
+        Snapshot Inspect()
+        {
+            const Session& s = g_session;
+            Snapshot snapshot;
+            snapshot.state = State(int(s.state.load()));
+            snapshot.peer = FromSockaddr(s.peer);
+            snapshot.token = s.token;
+            snapshot.nonce = s.nonce;
+            snapshot.seed = s.seed;
+            snapshot.peerWhereKnown = s.peerWhereKnown;
+            snapshot.peerWhere = s.peerWhere.where;
+            snapshot.remoteInputs = s.step.remote.size();
+            snapshot.remoteChecksums = s.step.remoteChecksums.size();
+            snapshot.earlySegments = s.early.size();
+            for (const auto& [key, early] : s.early)
+            {
+                snapshot.earlyInputs += early.inputs.size();
+                snapshot.earlyChecksums += early.checksums.size();
+            }
+            snapshot.remoteSetups = s.remoteSetups.size();
+            snapshot.delays = s.delays.size();
+            snapshot.peerReceived = s.step.peerReceived;
+            snapshot.frame = s.step.lastFrame;
+            snapshot.localInputs = s.step.local.size();
+            if (!s.step.local.empty())
+            {
+                snapshot.localFirst = s.step.local.begin()->first;
+                snapshot.localLast = s.step.local.rbegin()->first;
+            }
+            snapshot.sent = s.testSent;
+            snapshot.welcomes = s.testWelcomes;
+            snapshot.refusals = s.testRefusals;
+            snapshot.endReason = s.endReason;
+            return snapshot;
+        }
     }
 }

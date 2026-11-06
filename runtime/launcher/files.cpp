@@ -344,9 +344,11 @@ namespace launcher
         return {};
     }
 
-    std::wstring CheckDisc(const std::wstring& chosen, Disc& disc)
+    std::wstring CheckDisc(const Folder& folder, const std::wstring& chosen, Disc& disc, bool* releaseBroken)
     {
         disc = {};
+        if (releaseBroken)
+            *releaseBroken = false;
         const std::wstring path = FullPath(chosen);
         const std::wstring name = FileNameOf(path);
         const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -364,18 +366,31 @@ namespace launcher
         if (narrow.empty())
             return L"The game can't open " + path + L": its path has characters it can't use. Move the disc image to a folder "
                 L"such as C:\\Games, or rename it.";
-        std::vector<uint8_t> xex;
-        switch (disc::ReadExecutable(narrow, xex))
+        // Its version patch is the release's; its check is remembered in the data folder, if the game can use its path.
+        disc::Options options;
+        options.patchDirectory = folder.root;
+        options.dataDirectory = NarrowPath(folder.data);
+        disc::Game game;
+        std::string problem;
+        switch (disc::Prepare(narrow, options, game, problem))
         {
         case disc::Check::kOk:
             break;
         case disc::Check::kUnreadable:
         case disc::Check::kOtherGame:
-            return name + L" doesn't appear to be a valid " GAME_DISC " disc image.";
+            return name + L" doesn't appear to be a valid " GAME_ANY_DISC " disc image.";
+        case disc::Check::kOtherVersion:
+            return FromNarrow(problem);
+        case disc::Check::kDamaged:
+            return name + L": " + FromNarrow(problem);
+        case disc::Check::kBroken:
+            if (releaseBroken)
+                *releaseBroken = true;
+            return name + L": " + FromNarrow(problem);
         }
         disc.path = path;
         disc.narrow = narrow;
-        disc.xex = std::move(xex);
+        disc.xex = std::move(game.xex);
         return {};
     }
 

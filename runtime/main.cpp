@@ -1,11 +1,13 @@
 // Recompilation runtime entry point.
 //
 // Usage: <executable> [game data directory] [disc image]
-// The game runs from its disc image: an .iso of GAME_DISC (CMakeLists.txt) next to the executable (or in the data
+// The game runs from its disc image: an .iso of GAME_ANY_DISC (CMakeLists.txt) next to the executable (or in the data
 // directory or the working directory, or settings.ini's disc_image), whose default.xex is checked by its SHA-256 (the
-// version disc_image.cpp names) and unpacked in memory (see disc_image.h). A development checkout keeps default.xex
-// and default.pe (the decrypted, decompressed image produced by tools/xexunpack.ps1) in its data directory instead,
-// and they're used when present.
+// version disc_image.cpp names) and unpacked in memory (see disc_image.h); or a disc of another version of the game,
+// with that version's patch next to the executable (a release has it), which makes the supported version from it. A
+// development checkout keeps default.xex and default.pe (the decrypted, decompressed image produced by
+// tools/xexunpack.ps1) in its data directory instead, and they're used when present, with a disc whose files are the
+// supported version's (disc_image.h).
 // The data directory holds settings.ini, saves, caches and the hard disk's folders: by default "private" in the working
 // directory if it has default.xex (a development checkout), else "data" next to the executable (a release).
 // HEADLESS=1 runs without a window or renderer (the GPU command stream is still executed).
@@ -25,6 +27,7 @@
 #include "log.h"
 #include "module/loader.h"
 #include "netplay/fingerprint.h"
+#include "netplay/identity.h"
 #include "netplay/session.h"
 #include "settings.h"
 #include "ui/window.h"
@@ -179,35 +182,32 @@ namespace
         return images;
     }
 
-    // The game's executable (default.xex) and image (default.pe): the data directory's if it has them (a development
-    // checkout), else read from a disc image, checked and unpacked in memory. `discImage` is the disc image to try first
-    // (from the command line or settings.ini, or empty), and is set to the one used. Returns an empty string, or what's
-    // wrong.
-    std::string ReadGame(const std::string& dataDirectory, std::string& discImage, std::vector<uint8_t>& xex,
-        std::vector<uint8_t>& image)
+    // The game from a disc image (disc_image.h): its executable (default.xex) and image (default.pe), and the disc's files
+    // a version patch serves composed. The executable is read from the disc image, checked and unpacked in memory, or made
+    // with a version patch from the executable's folder; or for a disc whose files are the supported version's, the data
+    // directory's if it has them (a development checkout). `discImage` is the disc image to try first (from the command
+    // line or settings.ini, or empty), and is set to the one used. Returns an empty string, or what's wrong.
+    std::string ReadGame(const std::string& dataDirectory, std::string& discImage, disc::Game& game)
     {
         const std::vector<std::string> images = FindDiscImages(discImage, dataDirectory);
         const auto exists = [](const std::string& path) {
             std::error_code error;
             return std::filesystem::is_regular_file(path, error);
         };
-        if (ReadWholeFile(dataDirectory + "/default.xex", xex) && ReadWholeFile(dataDirectory + "/default.pe", image))
+        disc::Options options;
+        options.patchDirectory = ExecutableDirectory();
+        options.dataDirectory = dataDirectory;
+        std::vector<uint8_t> developmentXex, developmentImage;
+        if (ReadWholeFile(dataDirectory + "/default.xex", developmentXex) && ReadWholeFile(dataDirectory + "/default.pe", developmentImage))
         {
-            for (const std::string& candidate : images)
-            {
-                if (exists(candidate))
-                {
-                    discImage = candidate;
-                    return {};
-                }
-            }
-            return "No " GAME_DISC " disc image was found.";
+            options.developmentXex = &developmentXex;
+            options.developmentImage = &developmentImage;
         }
 
         const std::string folder = ExecutableDirectory();
-        const std::string where = "Put your " GAME_DISC " disc image (.iso) in this folder:\n\n" +
+        const std::string where = "Put your " GAME_ANY_DISC " disc image (.iso) in this folder:\n\n" +
             (folder.empty() ? std::string("the game's folder") : folder);
-        std::string problems;
+        std::string problems, broken;
         for (const std::string& candidate : images)
         {
             if (!exists(candidate))
@@ -216,26 +216,40 @@ namespace
                 continue;
             }
             const std::string name = std::filesystem::path(candidate).filename().string();
-            switch (disc::ReadExecutable(candidate, xex))
+            std::string problem;
+            switch (disc::Prepare(candidate, options, game, problem))
             {
             case disc::Check::kOk:
-                if (!disc::Unpack(xex, image))
-                    return "Can't unpack the game's executable from " + name + ".";
                 discImage = candidate;
-                LOG_INFO("Game from %s", candidate.c_str());
+                if (game.version)
+                    LOG_INFO("Game from %s, %s, played as " GAME_DISC " with the version patch %s", candidate.c_str(), game.version->described,
+                        game.version->patch);
+                else
+                    LOG_INFO("Game from %s%s", candidate.c_str(), options.developmentXex ? " (the executable from the data directory)" : "");
                 return {};
             case disc::Check::kUnreadable:
             case disc::Check::kOtherGame:
-                problems += "\n- " + name + " doesn't appear to be a valid " GAME_DISC " disc image.";
+                problems += "\n- " + name + " doesn't appear to be a valid " GAME_ANY_DISC " disc image.";
+                break;
+            case disc::Check::kOtherVersion:
+            case disc::Check::kDamaged:
+                problems += "\n- " + name + ": " + problem;
+                break;
+            case disc::Check::kBroken:
+                // The release's (its version patch), which another disc image won't mend: said alone, as the launcher does.
+                if (broken.empty())
+                    broken = name + ": " + problem;
                 break;
             }
         }
-        return problems.empty() ? where : "No " GAME_DISC " disc image was found:" + problems + "\n\n" + where;
+        if (!broken.empty())
+            return broken;
+        return problems.empty() ? where : "No disc image the game can play was found:" + problems + "\n\n" + where;
     }
 
-    bool MountDevices(const std::string& dataDirectory, const std::string& discImage)
+    bool MountDevices(const std::string& dataDirectory, const std::string& discImage, vfs::ComposedFiles composed)
     {
-        auto disc = vfs::OpenIsoDevice(discImage);
+        auto disc = vfs::OpenIsoDevice(discImage, std::move(composed));
         if (!disc)
             return false;
         vfs::Mount("\\Device\\Cdrom0", std::move(disc));
@@ -318,10 +332,15 @@ int main(int argc, char** argv)
     profile::NameThread("Main (window)");
 
     std::string discImage = argc > 2 ? argv[2] : settings::DiscImage();
-    std::vector<uint8_t> xex, image;
-    if (const std::string problem = ReadGame(dataDirectory, discImage, xex, image); !problem.empty())
+    disc::Game game;
+    if (const std::string problem = ReadGame(dataDirectory, discImage, game); !problem.empty())
         return Fail(problem);
+    const std::vector<uint8_t>& xex = game.xex;
+    const std::vector<uint8_t>& image = game.image;
     config::SetDiscImage(discImage);
+    // Netplay's identity of the disc covers the executable as it runs, in default.xex's place, and the files as served
+    // (netplay/identity.h).
+    netplay::identity::SetGame(xex, image, game.files);
     // The title's SPA data among the executable's resources: the window's icon, and the achievements' names and pictures.
     spa::Load(xex, image);
 
@@ -369,7 +388,7 @@ int main(int argc, char** argv)
     if (const char* fingerprint = std::getenv(GAME_PREFIX "_FINGERPRINT"); fingerprint && std::atoi(fingerprint) != 0)
         return netplay::fingerprint::Run();
 
-    if (!MountDevices(dataDirectory, discImage))
+    if (!MountDevices(dataDirectory, discImage, std::move(game.files)))
         return Fail("Can't open the disc image " + discImage + ".");
 
     // The window and renderer exist before the game initializes the GPU.

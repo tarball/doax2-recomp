@@ -7,7 +7,7 @@
 //
 // XAPI fiber record (allocated by CreateFiber / ConvertThreadToFiber):
 //   [0] parameter  [4] stack allocation base  [8] stack base (top)  [12] stack limit
-//   [28] saved LR (0x82785660, the startup trampoline, for a fiber that hasn't run)
+//   [28] saved LR (0x827869A0, the startup trampoline, for a fiber that hasn't run)
 //   [48] saved r1 (64-bit)  [288] saved r31 (64-bit; the start address for a new fiber)
 #include "guest_abi.h"
 #include "kernel/threads.h"
@@ -20,13 +20,13 @@
 
 #include <windows.h>
 
-extern "C" PPC_FUNC(__imp__sub_827831B0); // XAPI DeleteFiber
+extern "C" PPC_FUNC(__imp__sub_82784310); // XAPI DeleteFiber
 
 namespace
 {
     constexpr uint32_t kPcrCurrentThread = 0x100;
-    constexpr uint32_t kStartupTrampoline = 0x82785660; // a new fiber's saved LR
-    constexpr uint32_t kStartFiber = 0x82783220;        // what the trampoline calls with the start routine: runs it, then exits
+    constexpr uint32_t kStartupTrampoline = 0x827869A0; // a new fiber's saved LR
+    constexpr uint32_t kStartFiber = 0x82784380;        // what the trampoline calls with the start routine: runs it, then exits
     constexpr uint32_t kPcrStackBase = 0x70;
     constexpr uint32_t kPcrStackLimit = 0x74;
     constexpr uint32_t kKThreadStackBase = 0x5C;
@@ -116,8 +116,8 @@ namespace
     }
 }
 
-// XAPI SwitchToFiber's core (SwitchToFiber, 0x82783210, branches to it): r3 = target fiber record.
-PPC_FUNC(sub_82785670)
+// XAPI SwitchToFiber's core (SwitchToFiber, 0x82784370, branches to it): r3 = target fiber record.
+PPC_FUNC(sub_827869B0)
 {
     const uint32_t target = ctx.r3.u32;
     const uint32_t pcr = ctx.r13.u32;
@@ -146,7 +146,7 @@ PPC_FUNC(sub_82785670)
 }
 
 // XAPI DeleteFiber: r3 = fiber record. Frees the host fiber, then XAPI frees the stack and record.
-PPC_FUNC(sub_827831B0)
+PPC_FUNC(sub_82784310)
 {
     const uint32_t record = ctx.r3.u32;
     {
@@ -159,5 +159,5 @@ PPC_FUNC(sub_827831B0)
             g_fibers.erase(it);
         }
     }
-    __imp__sub_827831B0(ctx, base);
+    __imp__sub_82784310(ctx, base);
 }

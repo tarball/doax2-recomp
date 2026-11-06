@@ -2268,11 +2268,16 @@ namespace netplay::session
             ReceiveAll();
         }
 
-        // The joining machine's hellos, until the host welcomes it, once this machine knows its identity (the disc
-        // image's hash).
+        // The joining machine's hellos, until the host welcomes it, once this machine knows its identity (the disc's).
+        // Either machine ends the session if it can't know it.
         void SendHelloIfDue()
         {
             Session& s = g_session;
+            if (s.state == State::kConnecting && identity::DiscHashFailed())
+            {
+                End("this machine can't read its disc image's files to identify them (a damaged or cut disc image?)");
+                return;
+            }
             if (s.state != State::kConnecting || s.host || Clock::now() - s.lastHello < kHelloInterval || !LocalIdentity())
                 return;
             Hello hello{};

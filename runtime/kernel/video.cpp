@@ -64,8 +64,8 @@ namespace
         u16(0x4A, kernel::kDisplayWidth);  // actual display width
     }
 
-    // The display's transfer function, which D3D's gamma ramp functions (DOA4's sub_827610D8 and DOAX2's sub_8270CD28,
-    // and for piecewise linear ramps sub_827612C8 and sub_8270CF08) adjust every ramp the game sets for: they take its
+    // The display's transfer function, which D3D's gamma ramp functions (DOA4's sub_827610D8 and DOAX2's sub_8270DDE8,
+    // and for piecewise linear ramps sub_827612C8 and sub_8270DFC8) adjust every ramp the game sets for: they take its
     // values as sRGB, decode them to linear light and encode that for the display. Type 1 (sRGB, a PC monitor) re-encodes as sRGB, so ramps apply unchanged; 2 (an HDTV,
     // as over HDMI or component) and any other but 3 use BT.709's curve, which darkens shadows; 3 a power of 1/`power`.
     // DISPLAY_GAMMA=type[,power] overrides it.

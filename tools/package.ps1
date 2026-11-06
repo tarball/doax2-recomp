@@ -1,29 +1,37 @@
 # Builds a release for players: build\package\doax2-recomp\ and a zip of it (ANALYSIS.md, Phase 5, Packaging, The
-# launcher). It holds the game's code, recompiled, but none of the game's data: players bring their disc image, which the
-# launcher checks and the game reads its files from.
+# launcher). It holds the game's code, recompiled, and the version patch that plays the USA disc as Title Update 2, but
+# none of the game's files: players bring their disc image, which the launcher checks and the game reads its files from.
 #   DOAX2 Launcher.exe                     what players start (runtime/launcher/)
 #   doax2.exe, doax2_ppc.dll               the game's executable and its code module (the Release build's)
+#   doax2_tu2.vpatch                       what plays the USA disc as Title Update 2 (runtime/disc_image.h)
 #   FFmpeg's DLLs                          its audio decoder
 #   README.txt, licenses\
 # It stops if anything else is in it.
-# Usage: powershell -ExecutionPolicy Bypass -File tools\package.ps1 [-Version <name>] [-NoBuild] [-NoZip]
+# Usage: powershell -ExecutionPolicy Bypass -File tools\package.ps1 -VersionPatch <file> [-Version <name>] [-NoBuild]
+#   [-NoZip]
 #   -Version names the release (default: git describe): a release's is its tag in the release repository, its date,
-#   time and commit (v2026.10.30.115807-f2e1697), which the README's source link names. -NoBuild packages the Release
-#   build as it is.
+#   time and commit (v2026.10.30.115807-f2e1697), which the README's source link names. -VersionPatch is the version
+#   patch (tools\versionpatch.py's, made from the USA disc and Title Update 2's executable: game-derived, so
+#   tools\release.ps1 builds it for each release, and it's never committed). Every disc needs it, since the game plays
+#   Title Update 2, which is on no disc: a release without it plays nothing. -NoBuild packages the Release build as it
+#   is.
 param(
     [string]$Version = '',
+    [string]$VersionPatch = '',
     [switch]$NoBuild,
     [switch]$NoZip
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-# The game: CMakeLists.txt's GAME_TITLE, GAME_DISC, GAME_PREFIX, the executable and the launcher (GAME_LAUNCHER).
+# The game: CMakeLists.txt's GAME_TITLE, GAME_ANY_DISC (the disc players need), GAME_PREFIX, the executable and the
+# launcher (GAME_LAUNCHER); the version patch's file (runtime/disc_image.cpp's other version).
 $title = 'Dead or Alive Xtreme 2'
 $disc = 'Dead or Alive Xtreme 2 (USA)'
 $prefix = 'DOAX2'
 $executable = 'doax2'
 $launcher = "$prefix Launcher.exe"
 $folderName = 'doax2-recomp'
+$versionPatchName = "$($executable)_tu2.vpatch"
 # The release repository, a commit and a tag a release, and the XenonRecomp fork.
 $sourceRepository = 'https://github.com/tarball/doax2-recomp'
 $xenonRepository = 'https://github.com/tarball/XenonRecomp'
@@ -42,6 +50,10 @@ if (-not $xenonRecomp) {
 if (-not (Test-Path (Join-Path $xenonRecomp 'LICENSE.md'))) { throw "No XenonRecomp checkout in $xenonRecomp (set XENONRECOMP_ROOT)" }
 $ffmpeg = Join-Path $root 'third_party\ffmpeg'
 if (-not (Test-Path (Join-Path $ffmpeg 'LICENSE.txt'))) { throw "FFmpeg isn't in $ffmpeg (run tools\getffmpeg.ps1): without it the game has no XMA audio or radio." }
+if (-not $VersionPatch) { throw "Every disc plays with the version patch: give -VersionPatch <$versionPatchName> (tools\release.ps1 makes it)." }
+if (-not (Test-Path -LiteralPath $VersionPatch -PathType Leaf)) { throw "There's no version patch $VersionPatch." }
+$magic = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $VersionPatch).Path), 0, 4)
+if ($magic -ne 'VPAT') { throw "$VersionPatch isn't a version patch." }
 
 if (-not $NoBuild) {
     $env:XENONRECOMP_ROOT = $xenonRecomp
@@ -70,10 +82,14 @@ $dlls = @(Get-ChildItem (Join-Path $build '*.dll') | Where-Object { $_.Name -ne 
 Copy-Item (Join-Path $build $launcher), (Join-Path $build "$executable.exe"), (Join-Path $build $module) $package
 $dlls | Copy-Item -Destination $package
 $moduleHash = (Get-FileHash (Join-Path $package $module) -Algorithm SHA256).Hash.ToLowerInvariant()
+# The version patch, beside the game's executable, where it looks for it.
+Copy-Item -LiteralPath $VersionPatch (Join-Path $package $versionPatchName)
+$patchHash = (Get-FileHash (Join-Path $package $versionPatchName) -Algorithm SHA256).Hash.ToLowerInvariant()
 
 # Licenses: this project's, the GPL-3.0 (LICENSE), and those of what's shipped or compiled in. In doax2.exe: xxHash
 # (BSD-2), and parts that follow Xenia's (BSD-3-Clause: tools\licenses\xenia.txt); in the game's code module:
-# XenonRecomp's ppc_context.h (MIT) and simde (MIT); beside them: FFmpeg (LGPL).
+# XenonRecomp's ppc_context.h (MIT) and simde (MIT); beside them: FFmpeg (LGPL). The LZMA SDK's decoder in doax2.exe and
+# the launcher (third_party\lzma) is in the public domain, so it has no license to ship.
 Copy-Item (Join-Path $root 'LICENSE') (Join-Path $licenses "$folderName (GPL-3.0).txt")
 $third = Join-Path $xenonRecomp 'thirdparty'
 Copy-Item (Join-Path $xenonRecomp 'LICENSE.md') (Join-Path $licenses 'XenonRecomp.txt')
@@ -89,7 +105,7 @@ Set-Content (Join-Path $licenses 'FFmpeg.txt') -Encoding UTF8 ("The FFmpeg DLLs 
 $readme = @"
 $title for Windows ($Version)
 
-An unofficial Windows port of the Xbox 360 game. It doesn't include any of the game's resources: you need your own
+An unofficial Windows port of the Xbox 360 game. It doesn't include the game's files: you need your own
 $disc disc image to play.
 
 To play
@@ -119,7 +135,7 @@ Set-Content (Join-Path $package 'README.txt') -Encoding ASCII ($readme -replace 
 
 # Only these files: the game's code, but nothing else of the game (its data, the generated source, build files) nor of a
 # player's folder.
-$expected = @($launcher, "$executable.exe", $module, 'README.txt', 'licenses') + @($dlls | ForEach-Object Name)
+$expected = @($launcher, "$executable.exe", $module, $versionPatchName, 'README.txt', 'licenses') + @($dlls | ForEach-Object Name)
 $unexpected = @(Get-ChildItem $package | Where-Object { $expected -notcontains $_.Name })
 if ($unexpected.Count) { throw "Unexpected files in the package: $($unexpected.Name -join ', ')" }
 $notShipped = @(Get-ChildItem -Recurse $package | Where-Object {
@@ -133,6 +149,7 @@ $files | Group-Object { ($_.FullName.Substring($package.Length + 1) -split '\\')
     '  {0,-24} {1,5} files {2,8:N1} MB' -f $_.Name, $_.Count, (($_.Group | Measure-Object Length -Sum).Sum / 1MB)
 }
 "The game's code: $module, SHA-256 $moduleHash"
+"The version patch: $versionPatchName, SHA-256 $patchHash"
 if ($NoZip) { return }
 $zip = Join-Path $packages "$folderName-$Version.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

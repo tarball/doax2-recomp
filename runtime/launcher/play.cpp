@@ -89,17 +89,27 @@ namespace launcher
         }
         if (candidates.empty())
             return Readiness::kNeedDisc;
-        std::wstring first;
+        // The first problem, unless one was the release's (its version patch), which another disc image won't mend.
+        std::wstring first, broken;
         for (const std::wstring& candidate : candidates)
         {
-            const std::wstring problem = CheckDisc(candidate, disc);
+            bool releaseBroken = false;
+            const std::wstring problem = CheckDisc(folder, candidate, disc, &releaseBroken);
             if (problem.empty())
             {
                 first.clear();
+                broken.clear();
                 break;
             }
             if (first.empty())
                 first = problem;
+            if (releaseBroken && broken.empty())
+                broken = problem;
+        }
+        if (!broken.empty())
+        {
+            message = broken;
+            return Readiness::kFailed;
         }
         if (!first.empty())
         {

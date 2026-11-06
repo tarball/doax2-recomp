@@ -382,7 +382,7 @@ namespace launcher
                 showPrimary = false;
                 break;
             case Screen::kNeedDisc:
-                heading = L"Select your " GAME_DISC " disc image";
+                heading = L"Select your " GAME_ANY_DISC " disc image";
                 body = s.message; // what's wrong with the one tried, if one was
                 primary = L"&Select disc image...";
                 showDisc = false;
@@ -471,7 +471,7 @@ namespace launcher
                 return chosen;
             const COMDLG_FILTERSPEC types[] = { { L"Disc images (*.iso)", L"*.iso" }, { L"All files", L"*.*" } };
             dialog->SetFileTypes(2, types);
-            dialog->SetTitle(L"Select your " GAME_DISC " disc image");
+            dialog->SetTitle(L"Select your " GAME_ANY_DISC " disc image");
             dialog->SetOkButtonLabel(L"Select");
             FILEOPENDIALOGOPTIONS options = 0;
             dialog->GetOptions(&options);

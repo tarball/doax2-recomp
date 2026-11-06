@@ -58,6 +58,11 @@ namespace netplay
         // Guest memory the game writes that differs between runs of the same frames without changing them, as
         // [start, end) ranges: timestamps and profiling timers. Sync tests don't compare it.
         std::vector<std::pair<uint32_t, uint32_t>> unchecked;
+        // The disc's files a session's identity of the disc leaves out (netplay/identity.h), by path on the disc (a folder
+        // ending with '\' leaves out what it holds): what doesn't change a fight, and differs between discs a version patch
+        // plays alike, or would keep their players apart (DOA4: the movies, spr.afs's sprites and fonts, avt.afs's DOA
+        // Online avatars). The fights' checksums still catch what does change one.
+        std::vector<std::string> identityLeavesOut;
         // The game's state in physical memory (the views from 0xA0000000, which the write tracker doesn't cover), as
         // [start, end) ranges of guest addresses, at a frame boundary: a savestate holds them whole (DOA4: the ring the
         // fight records its frames in for the KO's replay, and its models' blocks, heaps::PhysicalBlocks).

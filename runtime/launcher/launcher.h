@@ -2,8 +2,9 @@
 
 // The launcher, "<GAME_PREFIX> Launcher.exe" (ANALYSIS.md, Phase 5, Packaging, The launcher): what a player starts. It
 // runs from the release folder tools\package.ps1 makes, which holds the game's executable and the game's code,
-// recompiled (<executable>_ppc.dll), but none of the game's data. It asks for the player's disc image and checks it as
-// the game does, remembers it in the game's settings, and starts the game, on this PC or in a netplay session.
+// recompiled (<executable>_ppc.dll), but none of the game's data, and the version patches that play the game's other
+// versions' discs (disc_image.h). It asks for the player's disc image and checks it as the game does, remembers it in the
+// game's settings, and starts the game, on this PC or in a netplay session.
 //
 // Paths are wide strings throughout, so the release folder can be anywhere. The game gets its data directory relative
 // to the release folder and the disc image in the narrow code page its paths use (NarrowPath).
@@ -60,11 +61,13 @@ namespace launcher
     {
         std::wstring path;        // as chosen, full
         std::string narrow;       // as the game opens it (NarrowPath)
-        std::vector<uint8_t> xex; // its default.xex, as it is on the disc
+        std::vector<uint8_t> xex; // the executable the game runs: its default.xex, or a version patch's XEX header
     };
-    // Checks a disc image as the game does (disc::ReadExecutable: the supported version's default.xex), reading its
-    // default.xex into `disc`. Empty if it's the one, else what's wrong, for the player.
-    std::wstring CheckDisc(const std::wstring& path, Disc& disc);
+    // Checks a disc image as the game does (disc::Prepare: the supported version's default.xex, or another version's with
+    // its version patch from the release folder, its files checked once and remembered in the data folder), into `disc`.
+    // Empty if it's one the game plays, else what's wrong, for the player; `releaseBroken` set if that's the release's
+    // (its version patch damaged, or one this PC can't read), not the disc image's.
+    std::wstring CheckDisc(const Folder& folder, const std::wstring& path, Disc& disc, bool* releaseBroken = nullptr);
     // The disc image settings.ini names (disc_image, the game's own setting), or empty.
     std::wstring RememberedDisc(const Folder& folder);
     // The .iso files next to the launcher and in the data directory, where the game also looks for one.

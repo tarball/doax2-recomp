@@ -6,19 +6,21 @@ cmake_policy(SET CMP0141 NEW)
 # The game. GAME_PREFIX names the targets and, in lower case, the executable (doax2.exe) and its log; the runtime
 # reads its environment variables with it (DOAX2_TRACE, ...) and gets GAME_TITLE for its window and messages. The
 # runtime's sources only use these macros, so they can stay the same as doa4-recomp's. GAME_VERSION is the version of
-# the game it supports, when the game had more than one (DOAX2 had one: none), and GAME_REGION the regions of the disc;
-# with the title they make GAME_DISC, the disc image players need as the launcher and the messages name it ("Dead or
-# Alive Xtreme 2 (USA)"). GAME_LAUNCHER names the launcher, what a player starts in a release ("DOAX2 Launcher.exe",
+# the game it supports, when the game had more than one (DOAX2's Title Update 2), and GAME_REGION the regions of the
+# disc. GAME_DISC is the supported version's name in the log: its disc's name when it's on one (DOA4's "Dead or Alive 4
+# (Rev 1) (USA, Europe)"), else the title alone, as DOAX2's ("Dead or Alive Xtreme 2": Title Update 2 is on no disc).
+# GAME_ANY_DISC is the disc image the launcher and the messages ask players for, the title with the regions joined by
+# slashes ("Dead or Alive Xtreme 2 (USA)"): a release also plays the game's other versions' discs, with their version
+# patches (runtime/disc_image.h), and when the supported version is on no disc, as DOAX2's, every disc is another
+# version's. GAME_LAUNCHER names the launcher, what a player starts in a release ("DOAX2 Launcher.exe",
 # runtime/launcher/).
 set(GAME_PREFIX DOAX2)
 set(GAME_TITLE "Dead or Alive Xtreme 2")
-set(GAME_VERSION "")
+set(GAME_VERSION "Title Update 2")
 set(GAME_REGION "USA")
-if (GAME_VERSION)
-    set(GAME_DISC "${GAME_TITLE} (${GAME_VERSION}) (${GAME_REGION})")
-else()
-    set(GAME_DISC "${GAME_TITLE} (${GAME_REGION})")
-endif()
+set(GAME_DISC "${GAME_TITLE}")
+string(REPLACE ", " "/" GAME_REGIONS "${GAME_REGION}")
+set(GAME_ANY_DISC "${GAME_TITLE} (${GAME_REGIONS})")
 string(TOLOWER "${GAME_PREFIX}" GAME_EXECUTABLE)
 set(GAME_LAUNCHER "${GAME_PREFIX} Launcher")
 # GAME_UTILITY_DRIVE: whether the hard disk has its raw Partition0, where XAPI keeps the header of the cache partition a
@@ -38,7 +40,12 @@ set(GAME_SYSTEM_UI_NOTIFICATIONS 1)
 # Xbox Live: ANALYSIS.md, Phase 8), so its launcher just plays.
 set(GAME_NETPLAY 0)
 
-project(${GAME_PREFIX}Recomp CXX)
+# The LZMA SDK's decoder (below) is C, which clang-cl compiles too: C's compiler is C++'s unless one is named (build.cmd
+# names C++'s, and a build directory configured before C was one of the languages has only C++'s).
+if (CMAKE_CXX_COMPILER AND NOT CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "${CMAKE_CXX_COMPILER}")
+endif()
+project(${GAME_PREFIX}Recomp C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,6 +76,13 @@ if (NOT PPC_SOURCES)
     message(FATAL_ERROR "No generated code in ppc/; run XenonRecomp with config/${GAME_PREFIX}.toml first")
 endif()
 
+# The LZMA SDK's decoder (third_party/lzma: 7-Zip's LzmaDec.c, public domain, unmodified), which decompresses version
+# patches' streams (runtime/version_patch.cpp): a library of its own for the runtime, the launcher and the tests, built
+# without warnings, since its code isn't ours to change.
+add_library(lzmadec STATIC third_party/lzma/LzmaDec.c)
+target_include_directories(lzmadec PUBLIC third_party/lzma)
+target_compile_options(lzmadec PRIVATE /w)
+
 # Runtime: everything except main(), shared by the game executable and the tests.
 # An OBJECT library, not STATIC: import implementations override weak stubs, and a linker never
 # pulls a static library member just to replace a weak definition, so they'd be silently dropped.
@@ -76,6 +90,7 @@ add_library(${GAME_PREFIX}Runtime OBJECT
     runtime/config.cpp
     runtime/settings.cpp
     runtime/disc_image.cpp
+    runtime/version_patch.cpp
     runtime/crash_handler.cpp
     runtime/guest_memory.cpp
     runtime/guest_setjmp.cpp
@@ -156,14 +171,14 @@ add_library(${GAME_PREFIX}Runtime OBJECT
     runtime/vfs/vfs.cpp)
 target_include_directories(${GAME_PREFIX}Runtime PUBLIC runtime "${CMAKE_SOURCE_DIR}/ppc" "${SIMDE_INCLUDE_DIR}" "${XXHASH_INCLUDE_DIR}")
 target_link_libraries(${GAME_PREFIX}Runtime PUBLIC xinput winmm xaudio2 ole32 d3d12 dxgi d3dcompiler dxguid dbghelp synchronization bcrypt ws2_32
-    windowscodecs)
+    windowscodecs lzmadec)
 target_compile_options(${GAME_PREFIX}Runtime PUBLIC /arch:AVX "/FI${CMAKE_SOURCE_DIR}/runtime/ppc_overrides.h")
 # The generated code's store map misses (preserve_all) must keep the YMM registers' upper halves: no vzeroupper on
 # return (runtime/store_miss.cpp).
 set_source_files_properties(runtime/store_miss.cpp PROPERTIES COMPILE_OPTIONS "/clang:-mno-vzeroupper")
 target_compile_definitions(${GAME_PREFIX}Runtime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
-    "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_DISC=\"${GAME_DISC}\""
-    "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" "GAME_LAUNCHER=\"${GAME_LAUNCHER}.exe\""
+    "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_VERSION=\"${GAME_VERSION}\"" "GAME_DISC=\"${GAME_DISC}\""
+    "GAME_ANY_DISC=\"${GAME_ANY_DISC}\"" "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" "GAME_LAUNCHER=\"${GAME_LAUNCHER}.exe\""
     "GAME_SYSTEM_UI_NOTIFICATIONS=${GAME_SYSTEM_UI_NOTIFICATIONS}")
 # The build's configuration, which netplay's handshake reports with the build (runtime/netplay/identity.h).
 target_compile_definitions(${GAME_PREFIX}Runtime PRIVATE "GAME_BUILD_CONFIG=\"$<CONFIG>\"")
@@ -313,8 +328,9 @@ target_link_options(${GAME_EXECUTABLE} PRIVATE /STACK:0x1000000)
 # What a player starts in a release (runtime/launcher/launcher.h; ANALYSIS.md, Phase 5, Packaging, The launcher): it
 # checks the release's files and the player's disc image, remembers the disc image, and starts the game, on this PC or
 # in a netplay session. A program of its own (the executable keeps its name, which the module imports from): the
-# runtime's disc reader and nothing else of the runtime, the C runtime linked in, only Windows' own DLLs imported, and a
-# manifest for the common controls' visual styles and per-monitor DPI awareness.
+# runtime's disc reader and version patch applier (a release plays the game's other versions' discs with one) and nothing
+# else of the runtime, the C runtime linked in, only Windows' own DLLs imported, and a manifest for the common controls'
+# visual styles and per-monitor DPI awareness.
 enable_language(RC)
 set(LAUNCHER_MANIFEST "${CMAKE_SOURCE_DIR}/runtime/launcher/launcher.manifest")
 configure_file(runtime/launcher/launcher.rc.in "${CMAKE_CURRENT_BINARY_DIR}/launcher/launcher.rc" @ONLY)
@@ -324,15 +340,16 @@ add_executable(${GAME_PREFIX}Launcher WIN32
     runtime/launcher/play.cpp
     runtime/launcher/window.cpp
     runtime/disc_image.cpp
+    runtime/version_patch.cpp
     runtime/vfs/iso_device.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/launcher/launcher.rc")
 set_target_properties(${GAME_PREFIX}Launcher PROPERTIES OUTPUT_NAME "${GAME_LAUNCHER}")
 set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/launcher/launcher.rc" APPEND PROPERTY OBJECT_DEPENDS "${LAUNCHER_MANIFEST}")
 target_include_directories(${GAME_PREFIX}Launcher PRIVATE runtime)
 target_compile_definitions(${GAME_PREFIX}Launcher PRIVATE $<$<COMPILE_LANGUAGE:CXX>:NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
-    _CRT_SECURE_NO_WARNINGS "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_DISC=\"${GAME_DISC}\""
-    "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" GAME_NETPLAY=${GAME_NETPLAY}>)
-target_link_libraries(${GAME_PREFIX}Launcher PRIVATE comctl32 ole32 shell32 shlwapi uuid bcrypt ws2_32)
+    _CRT_SECURE_NO_WARNINGS "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_VERSION=\"${GAME_VERSION}\""
+    "GAME_DISC=\"${GAME_DISC}\"" "GAME_ANY_DISC=\"${GAME_ANY_DISC}\"" "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" GAME_NETPLAY=${GAME_NETPLAY}>)
+target_link_libraries(${GAME_PREFIX}Launcher PRIVATE comctl32 ole32 shell32 shlwapi uuid bcrypt ws2_32 lzmadec)
 # The manifest is the resource's (launcher.rc.in), not one the linker makes.
 target_link_options(${GAME_PREFIX}Launcher PRIVATE /MANIFEST:NO)
 

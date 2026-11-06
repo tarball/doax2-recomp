@@ -1,11 +1,15 @@
 #include "netplay/identity.h"
 
 #include "config.h"
+#include "disc_image.h"
 #include "log.h"
+#include "netplay/game_state.h"
+#include "vfs/vfs.h"
 
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -81,102 +85,142 @@ namespace netplay::identity
             }
         }
 
-        // The disc image's hash: 0 not looked for yet, 1 being computed, 2 known.
+        // The disc's identity: 0 not looked for yet, 1 being found, 2 known, 3 its files couldn't be read.
         std::atomic<int> g_discState{ 0 };
         std::atomic<uint64_t> g_discHash{ 0 };
+        // The executable's hash, and the disc's files served composed (SetGame).
+        uint64_t g_executableHash = 0;
+        vfs::ComposedFiles g_composed;
+        // How the files' hash is made: changed with HashFiles, so that a hash an earlier build kept isn't taken for one.
+        constexpr char kFilesScheme[] = "files as served: path, size and XXH3, by path; 1";
 
-        std::string CachePath()
+        std::string Lower(std::string text)
         {
-            return config::DataDirectory() + "/disc_hash.txt";
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            return text;
         }
 
-        // disc_hash.txt: a line per disc image, "<size> <modification time> <hash> <path>" (the time as a FILETIME).
-        std::optional<uint64_t> CachedHash(const std::string& path, uint64_t size, uint64_t modified)
+        // Whether the identity leaves out a file or folder of the disc (lower case, '\'-separated): default.xex, which the
+        // executable stands for, and the game's own list, in which a folder ends with '\'.
+        bool LeftOut(const std::string& path, bool directory, const std::vector<std::string>& leaveOut)
         {
-            FILE* file = fopen(CachePath().c_str(), "r");
-            if (!file)
-                return std::nullopt;
-            std::optional<uint64_t> found;
-            char line[2048];
-            while (!found && fgets(line, sizeof(line), file))
+            if (path == "default.xex")
+                return true;
+            for (const std::string& item : leaveOut)
             {
-                unsigned long long lineSize = 0, lineModified = 0, hash = 0;
-                int consumed = 0;
-                if (sscanf(line, "%llu %llu %llx %n", &lineSize, &lineModified, &hash, &consumed) < 3 || consumed <= 0)
+                const std::string lower = Lower(item);
+                if (lower.empty())
                     continue;
-                std::string linePath = line + consumed;
-                while (!linePath.empty() && (linePath.back() == '\n' || linePath.back() == '\r'))
-                    linePath.pop_back();
-                if (lineSize == size && lineModified == modified && _stricmp(linePath.c_str(), path.c_str()) == 0)
-                    found = hash;
+                if (path == lower || (directory && path + "\\" == lower) || (lower.back() == '\\' && path.rfind(lower, 0) == 0))
+                    return true;
             }
-            fclose(file);
-            return found;
+            return false;
         }
 
-        void CacheHash(const std::string& path, uint64_t size, uint64_t modified, uint64_t hash)
+        struct FileHash
         {
-            std::vector<std::string> kept; // the other images' lines
-            if (FILE* file = fopen(CachePath().c_str(), "r"))
+            std::string path; // lower case
+            uint64_t size = 0, hash = 0;
+        };
+
+        // The files of a folder of the disc and of the folders in it, each hashed as the device serves it.
+        bool HashFolder(vfs::Device& device, const std::string& folder, const std::vector<std::string>& leaveOut, std::vector<uint8_t>& buffer,
+            std::vector<FileHash>& files)
+        {
+            vfs::OpenRequest request;
+            request.path = folder;
+            request.directory = true;
+            std::unique_ptr<vfs::File> directory;
+            vfs::OpenResult result;
+            if (device.Open(request, directory, result) != 0 || !directory)
+                return false;
+            for (const vfs::EntryInfo& entry : directory->List())
             {
-                char line[2048];
-                while (fgets(line, sizeof(line), file))
+                const std::string path = Lower(folder.empty() ? entry.name : folder + "\\" + entry.name);
+                if (LeftOut(path, entry.isDirectory, leaveOut))
+                    continue;
+                if (entry.isDirectory)
                 {
-                    unsigned long long a = 0, b = 0, c = 0;
-                    int consumed = 0;
-                    if (sscanf(line, "%llu %llu %llx %n", &a, &b, &c, &consumed) < 3 || consumed <= 0)
-                        continue;
-                    std::string linePath = line + consumed;
-                    while (!linePath.empty() && (linePath.back() == '\n' || linePath.back() == '\r'))
-                        linePath.pop_back();
-                    if (_stricmp(linePath.c_str(), path.c_str()) != 0)
-                        kept.push_back(line);
+                    if (!HashFolder(device, path, leaveOut, buffer, files))
+                        return false;
+                    continue;
                 }
-                fclose(file);
+                request = {};
+                request.path = path;
+                request.nonDirectory = true;
+                std::unique_ptr<vfs::File> file;
+                if (device.Open(request, file, result) != 0 || !file)
+                    return false;
+                XXH3_state_t* state = XXH3_createState();
+                bool ok = state && XXH3_64bits_reset(state) == XXH_OK;
+                const uint64_t size = file->Info().size;
+                for (uint64_t at = 0; ok && at < size;)
+                {
+                    const uint32_t length = uint32_t(std::min<uint64_t>(buffer.size(), size - at));
+                    uint32_t read = 0;
+                    ok = file->Read(buffer.data(), length, at, read) == 0 && read == length;
+                    if (ok)
+                        XXH3_64bits_update(state, buffer.data(), length);
+                    at += length;
+                }
+                if (ok)
+                    files.push_back(FileHash{ path, size, XXH3_64bits_digest(state) });
+                if (state)
+                    XXH3_freeState(state);
+                if (!ok)
+                    return false;
             }
-            FILE* file = fopen(CachePath().c_str(), "w");
-            if (!file)
-                return;
-            for (const std::string& line : kept)
-                fputs(line.c_str(), file);
-            fprintf(file, "%llu %llu %016llX %s\n", (unsigned long long)size, (unsigned long long)modified, (unsigned long long)hash, path.c_str());
-            fclose(file);
+            return true;
         }
 
-        // Hashes the whole image, unbuffered (so as not to push the game's own reads out of the file cache).
-        std::optional<uint64_t> HashImage(const std::string& path, uint64_t size)
+        // The disc's files' hash, as the game's disc device serves them (another device on the same image, the same
+        // composed files, so that its reads don't wait on the game's handle, or the game's on them): each file's path, size
+        // and contents' hash, by path.
+        std::optional<uint64_t> HashFiles(const std::string& image, const std::vector<std::string>& leaveOut)
         {
-            const HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING, nullptr);
-            if (file == INVALID_HANDLE_VALUE)
+            const std::unique_ptr<vfs::Device> device = vfs::OpenIsoDevice(image, g_composed);
+            std::vector<uint8_t> buffer(8 << 20);
+            std::vector<FileHash> files;
+            if (!device || !HashFolder(*device, "", leaveOut, buffer, files))
                 return std::nullopt;
-            constexpr DWORD kChunk = 8 << 20; // a multiple of any sector size
-            void* buffer = VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            std::sort(files.begin(), files.end(), [](const FileHash& a, const FileHash& b) { return a.path < b.path; });
             XXH3_state_t* state = XXH3_createState();
-            bool ok = buffer && state && XXH3_64bits_reset(state) == XXH_OK;
-            uint64_t total = 0;
-            while (ok)
+            if (!state || XXH3_64bits_reset(state) != XXH_OK)
             {
-                DWORD read = 0;
-                if (!ReadFile(file, buffer, kChunk, &read, nullptr))
-                    ok = false;
-                else if (read == 0)
-                    break;
-                else
-                {
-                    XXH3_64bits_update(state, buffer, read);
-                    total += read;
-                }
-            }
-            const uint64_t hash = ok && state ? XXH3_64bits_digest(state) : 0;
-            if (state)
-                XXH3_freeState(state);
-            if (buffer)
-                VirtualFree(buffer, 0, MEM_RELEASE);
-            CloseHandle(file);
-            if (!ok || total != size)
+                if (state)
+                    XXH3_freeState(state);
                 return std::nullopt;
+            }
+            for (const FileHash& file : files)
+            {
+                XXH3_64bits_update(state, file.path.c_str(), file.path.size() + 1);
+                XXH3_64bits_update(state, &file.size, sizeof(file.size));
+                XXH3_64bits_update(state, &file.hash, sizeof(file.hash));
+            }
+            const uint64_t hash = XXH3_64bits_digest(state);
+            XXH3_freeState(state);
             return hash;
+        }
+
+        // The disc's identity: its files' hash and the executable's.
+        uint64_t Identity(uint64_t files)
+        {
+            const uint64_t parts[2] = { files, g_executableHash };
+            return XXH3_64bits(parts, sizeof(parts));
+        }
+
+        // What the files' hash of a disc image comes from besides its bytes: how it's made, what it leaves out, and the
+        // files served composed (their contents' SHA-256s). disc_checks.txt keeps a hash with this: one kept with other
+        // inputs (an earlier release's, extracted over) isn't taken.
+        uint64_t Inputs(const std::vector<std::string>& leaveOut)
+        {
+            std::string text = kFilesScheme;
+            for (const std::string& item : leaveOut)
+                text += '\0' + Lower(item);
+            text += '\0';
+            for (const auto& [path, file] : g_composed)
+                text += '\0' + path + '\0' + std::string(file->sha.begin(), file->sha.end());
+            return XXH3_64bits(text.data(), text.size());
         }
     }
 
@@ -213,44 +257,66 @@ namespace netplay::identity
         return GAME_BUILD_CONFIG;
     }
 
+    void SetGame(const std::vector<uint8_t>& xex, const std::vector<uint8_t>& image, const vfs::ComposedFiles& composed)
+    {
+        // The XEX header (the file's first bytes, as many as it says), then the image.
+        size_t header = xex.size();
+        if (xex.size() >= 12)
+            header = std::min<size_t>(header, size_t(xex[8]) << 24 | size_t(xex[9]) << 16 | size_t(xex[10]) << 8 | xex[11]);
+        g_executableHash = XXH3_64bits_withSeed(image.data(), image.size(), XXH3_64bits(xex.data(), header));
+        g_composed = composed;
+    }
+
     void StartDiscHash()
     {
         static std::once_flag once;
         std::call_once(once, [] {
             const std::string path = config::DiscImage();
-            WIN32_FILE_ATTRIBUTE_DATA attributes{};
-            if (path.empty() || !GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attributes))
+            const GameState* game = GetGameState();
+            const std::vector<std::string> leaveOut = game ? game->identityLeavesOut : std::vector<std::string>();
+            // Kept as "<the inputs' hash>-<the files' hash>", but while a file is served from elsewhere (DEBUG_DISC_FILE).
+            char inputs[17];
+            snprintf(inputs, sizeof(inputs), "%016llX", (unsigned long long)Inputs(leaveOut));
+            const char* overrides = std::getenv(GAME_PREFIX "_DEBUG_DISC_FILE");
+            const bool keep = !overrides || !*overrides;
+            if (const std::string remembered = keep ? disc::Remembered(config::DataDirectory(), path, "identity") : std::string();
+                remembered.size() == 33 && remembered.compare(0, 16, inputs) == 0 && remembered[16] == '-')
             {
-                LOG_WARN("Netplay: can't find the disc image (\"%s\") to identify it", path.c_str());
+                const uint64_t files = strtoull(remembered.c_str() + 17, nullptr, 16);
+                g_discHash = Identity(files);
                 g_discState = 2;
-                return;
-            }
-            const uint64_t size = uint64_t(attributes.nFileSizeHigh) << 32 | attributes.nFileSizeLow;
-            const uint64_t modified = uint64_t(attributes.ftLastWriteTime.dwHighDateTime) << 32 | attributes.ftLastWriteTime.dwLowDateTime;
-            if (const std::optional<uint64_t> cached = CachedHash(path, size, modified))
-            {
-                g_discHash = *cached;
-                g_discState = 2;
-                LOG_INFO("Netplay: the disc image's hash is %016llX (from %s)", (unsigned long long)*cached, CachePath().c_str());
+                LOG_INFO("Netplay: the disc's identity is %016llX (its files' %016llX, from disc_checks.txt)", (unsigned long long)g_discHash.load(),
+                    (unsigned long long)files);
                 return;
             }
             g_discState = 1;
-            LOG_INFO("Netplay: hashing the disc image %s (%.1f GB) to identify it; this happens once, the result is kept in %s",
-                path.c_str(), size / 1e9, CachePath().c_str());
-            std::thread([path, size, modified] {
+            LOG_INFO("Netplay: hashing the disc's files to identify them (%s)",
+                keep ? "once for this disc image: disc_checks.txt keeps it" : "every time, DEBUG_DISC_FILE serving a file from elsewhere");
+            std::thread([path, leaveOut, keep, inputs = std::string(inputs)] {
+                // Below the game's threads, and with low memory priority, so that the file cache's pages it reads go before
+                // the game's own.
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                MEMORY_PRIORITY_INFORMATION memory{ MEMORY_PRIORITY_LOW };
+                SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &memory, sizeof(memory));
                 const auto begin = std::chrono::steady_clock::now();
-                const std::optional<uint64_t> hash = HashImage(path, size);
+                const std::optional<uint64_t> files = HashFiles(path, leaveOut);
                 const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-                if (hash)
+                if (files)
                 {
-                    CacheHash(path, size, modified, *hash);
-                    LOG_INFO("Netplay: the disc image's hash is %016llX (%.1f s)", (unsigned long long)*hash, seconds);
+                    char text[17];
+                    snprintf(text, sizeof(text), "%016llX", (unsigned long long)*files);
+                    if (keep)
+                        disc::Remember(config::DataDirectory(), path, "identity", inputs + "-" + text);
+                    g_discHash = Identity(*files);
+                    LOG_INFO("Netplay: the disc's identity is %016llX (its files' %016llX, %.1f s)", (unsigned long long)g_discHash.load(),
+                        (unsigned long long)*files, seconds);
+                    g_discState = 2;
                 }
                 else
-                    LOG_WARN("Netplay: can't read the disc image %s to identify it", path.c_str());
-                g_discHash = hash.value_or(0);
-                g_discState = 2;
+                {
+                    LOG_ERROR("Netplay: can't read the disc's files to identify them (a file runs past the disc image's end?)");
+                    g_discState = 3;
+                }
             }).detach();
         });
     }
@@ -260,6 +326,11 @@ namespace netplay::identity
         if (g_discState.load() != 2)
             return std::nullopt;
         return g_discHash.load();
+    }
+
+    bool DiscHashFailed()
+    {
+        return g_discState.load() == 3;
     }
 
     std::string Machine()

@@ -1,12 +1,15 @@
-// XDVDFS disc image device. The directory tree is parsed once at mount; reads go straight to the image.
+// XDVDFS disc image device. The directory tree is parsed once at mount; reads go straight to the image, but for composed
+// files (a version patch's), whose extents read the image, memory or zeros.
 #include "vfs/iso_device.h"
 
 #include "kernel/status.h"
 #include "log.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string_view>
 
 #include <windows.h>
 
@@ -41,6 +44,19 @@ namespace vfs
             uint64_t partition = 0;
             uint64_t creationTime = 0;
             std::map<std::string, Node> nodes; // lower-case relative path -> node ("" is the root)
+            ComposedFiles composed;            // the files served composed, by the same paths
+
+            // A node's entry as served: a composed file's size instead of the disc's.
+            EntryInfo Served(const std::string& key, const Node& node) const
+            {
+                EntryInfo info = node.info;
+                if (const auto it = composed.find(key); it != composed.end() && !info.isDirectory)
+                {
+                    info.size = it->second->size;
+                    info.allocationSize = (info.size + kSectorSize - 1) / kSectorSize * kSectorSize;
+                }
+                return info;
+            }
 
             ~IsoImage()
             {
@@ -153,7 +169,7 @@ namespace vfs
             {
                 std::vector<EntryInfo> entries;
                 for (const std::string& child : m_node.children)
-                    entries.push_back(m_image->nodes.at(child).info);
+                    entries.push_back(m_image->Served(child, m_image->nodes.at(child)));
                 return entries;
             }
 
@@ -161,6 +177,163 @@ namespace vfs
             std::shared_ptr<const IsoImage> m_image;
             const Node& m_node;
         };
+
+        // A composed file: its extents read the disc's file of the same path (`node`), memory or zeros.
+        class ComposedIsoFile : public File
+        {
+        public:
+            ComposedIsoFile(std::shared_ptr<const IsoImage> image, const Node& node, std::shared_ptr<const ComposedFile> composed, const EntryInfo& info)
+                : m_image(std::move(image)), m_node(node), m_composed(std::move(composed)), m_info(info)
+            {
+            }
+
+            const EntryInfo& Info() const override { return m_info; }
+
+            uint32_t Read(void* buffer, uint32_t length, uint64_t offset, uint32_t& transferred) override
+            {
+                transferred = 0;
+                const ComposedFile& file = *m_composed;
+                if (offset >= file.size)
+                    return status::kEndOfFile;
+                const uint32_t count = uint32_t(std::min<uint64_t>(length, file.size - offset));
+                // The extent holding `offset`, then on from there.
+                auto extent = std::upper_bound(file.extents.begin(), file.extents.end(), offset,
+                    [](uint64_t at, const ComposedFile::Extent& e) { return at < e.offset; });
+                if (extent == file.extents.begin())
+                    return status::kUnsuccessful;
+                --extent;
+                auto* out = static_cast<uint8_t*>(buffer);
+                while (transferred < count && extent != file.extents.end())
+                {
+                    const uint64_t position = offset + transferred, within = position - extent->offset;
+                    const uint32_t part = uint32_t(std::min<uint64_t>(count - transferred, extent->length - within));
+                    switch (extent->from)
+                    {
+                    case ComposedFile::Extent::From::kDisc:
+                        if (uint32_t read = 0; !m_image->ReadAt(m_node.offset + extent->at + within, out + transferred, part, read) || read != part)
+                            return status::kUnsuccessful;
+                        break;
+                    case ComposedFile::Extent::From::kMemory:
+                        memcpy(out + transferred, file.memory.data() + extent->at + within, part);
+                        break;
+                    case ComposedFile::Extent::From::kZero:
+                        memset(out + transferred, 0, part);
+                        break;
+                    }
+                    transferred += part;
+                    ++extent;
+                }
+                return transferred == count ? status::kSuccess : status::kUnsuccessful;
+            }
+
+            uint32_t Write(const void*, uint32_t, uint64_t, uint32_t& transferred) override
+            {
+                transferred = 0;
+                return status::kAccessDenied;
+            }
+
+            uint32_t SetSize(uint64_t) override { return status::kAccessDenied; }
+            uint32_t SetDeleteOnClose() override { return status::kAccessDenied; }
+
+        private:
+            std::shared_ptr<const IsoImage> m_image;
+            const Node& m_node;
+            std::shared_ptr<const ComposedFile> m_composed;
+            EntryInfo m_info;
+        };
+
+        // DEBUG_DISC_FILE=<path on the disc>=<host file>[;...] (development): a file of the disc image is served from a
+        // host file instead, read-only, with that file's size, before a version patch's composed file; the disc must have
+        // the file. How the version patches' files were first tried in the game (analysis/version_patches.md, test 2).
+        const std::map<std::string, std::string>& DiscFileOverrides()
+        {
+            static const std::map<std::string, std::string> overrides = [] {
+                std::map<std::string, std::string> result;
+                const char* setting = std::getenv(GAME_PREFIX "_DEBUG_DISC_FILE");
+                for (std::string_view rest = setting ? setting : ""; !rest.empty();)
+                {
+                    const size_t end = std::min(rest.find(';'), rest.size());
+                    const std::string_view item = rest.substr(0, end);
+                    rest.remove_prefix(std::min(end + 1, rest.size()));
+                    const size_t equals = item.find('=');
+                    if (equals == std::string_view::npos || equals + 1 == item.size())
+                        continue;
+                    std::string path = Lower(item.substr(0, equals));
+                    std::replace(path.begin(), path.end(), '/', '\\');
+                    path.erase(0, std::min(path.find_first_not_of('\\'), path.size()));
+                    result[path] = std::string(item.substr(equals + 1));
+                }
+                return result;
+            }();
+            return overrides;
+        }
+
+        class OverrideFile : public File
+        {
+        public:
+            OverrideFile(HANDLE file, const EntryInfo& info) : m_file(file), m_info(info) {}
+            ~OverrideFile() override { CloseHandle(m_file); }
+
+            const EntryInfo& Info() const override { return m_info; }
+
+            uint32_t Read(void* buffer, uint32_t length, uint64_t offset, uint32_t& transferred) override
+            {
+                transferred = 0;
+                if (offset >= m_info.size)
+                    return status::kEndOfFile;
+                OVERLAPPED overlapped{};
+                overlapped.Offset = DWORD(offset);
+                overlapped.OffsetHigh = DWORD(offset >> 32);
+                DWORD read = 0;
+                const BOOL ok = ReadFile(m_file, buffer, DWORD(std::min<uint64_t>(length, m_info.size - offset)), &read, &overlapped);
+                transferred = read;
+                return ok || GetLastError() == ERROR_HANDLE_EOF ? status::kSuccess : status::kUnsuccessful;
+            }
+
+            uint32_t Write(const void*, uint32_t, uint64_t, uint32_t& transferred) override
+            {
+                transferred = 0;
+                return status::kAccessDenied;
+            }
+
+            uint32_t SetSize(uint64_t) override { return status::kAccessDenied; }
+            uint32_t SetDeleteOnClose() override { return status::kAccessDenied; }
+
+        private:
+            HANDLE m_file;
+            EntryInfo m_info;
+        };
+
+        // A disc file's entry as DEBUG_DISC_FILE serves it (the host file's size), and the host file opened if `handle`
+        // isn't null. False if no override names the file; an override whose host file can't be opened is an error.
+        bool Overridden(const std::string& key, const Node& node, EntryInfo& info, HANDLE* handle, uint32_t& code)
+        {
+            const auto it = DiscFileOverrides().find(key);
+            if (it == DiscFileOverrides().end() || node.info.isDirectory)
+                return false;
+            const HANDLE file = CreateFileA(it->second.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
+            LARGE_INTEGER size{};
+            if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &size))
+            {
+                if (file != INVALID_HANDLE_VALUE)
+                    CloseHandle(file);
+                LOG_ERROR("DEBUG_DISC_FILE: can't open %s for the disc's %s", it->second.c_str(), key.c_str());
+                code = status::kObjectNameNotFound;
+                return true;
+            }
+            info = node.info;
+            info.size = uint64_t(size.QuadPart);
+            info.allocationSize = (info.size + kSectorSize - 1) / kSectorSize * kSectorSize;
+            if (handle)
+            {
+                *handle = file;
+                LOG_INFO("DEBUG_DISC_FILE: the disc's %s is served from %s (%llu bytes)", key.c_str(), it->second.c_str(), (unsigned long long)info.size);
+            }
+            else
+                CloseHandle(file);
+            code = status::kSuccess;
+            return true;
+        }
 
         class IsoDevice : public Device
         {
@@ -189,7 +362,20 @@ namespace vfs
                     return 0xC0000103; // STATUS_NOT_A_DIRECTORY
                 if (request.nonDirectory && node.info.isDirectory)
                     return 0xC00000BA; // STATUS_FILE_IS_A_DIRECTORY
-                file = std::make_unique<IsoFile>(m_image, node);
+                EntryInfo info;
+                HANDLE host = INVALID_HANDLE_VALUE;
+                if (uint32_t code = 0; Overridden(it->first, node, info, &host, code))
+                {
+                    if (code != status::kSuccess)
+                        return code;
+                    file = std::make_unique<OverrideFile>(host, info);
+                    result = OpenResult::Opened;
+                    return status::kSuccess;
+                }
+                if (const auto composed = m_image->composed.find(it->first); composed != m_image->composed.end() && !node.info.isDirectory)
+                    file = std::make_unique<ComposedIsoFile>(m_image, node, composed->second, m_image->Served(it->first, node));
+                else
+                    file = std::make_unique<IsoFile>(m_image, node);
                 result = OpenResult::Opened;
                 return status::kSuccess;
             }
@@ -199,7 +385,9 @@ namespace vfs
                 const auto it = m_image->nodes.find(Lower(path));
                 if (it == m_image->nodes.end())
                     return status::kObjectNameNotFound;
-                info = it->second.info;
+                if (uint32_t code = 0; Overridden(it->first, it->second, info, nullptr, code))
+                    return code;
+                info = m_image->Served(it->first, it->second);
                 return status::kSuccess;
             }
 
@@ -212,7 +400,7 @@ namespace vfs
         };
     }
 
-    std::unique_ptr<Device> OpenIsoDevice(const std::string& isoPath)
+    std::unique_ptr<Device> OpenIsoDevice(const std::string& isoPath, ComposedFiles composed)
     {
         auto image = std::make_shared<IsoImage>();
         image->file = CreateFileA(isoPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
@@ -266,8 +454,39 @@ namespace vfs
             LOG_ERROR("Failed to read the directory tree of %s", isoPath.c_str());
             return nullptr;
         }
+        // A composed file's extents follow each other to its end, and those from the disc lie in the disc's file it stands
+        // for.
+        for (const auto& [path, file] : composed)
+        {
+            const auto node = image->nodes.find(path);
+            if (node == image->nodes.end() || node->second.info.isDirectory)
+            {
+                LOG_ERROR("%s has no file %s to compose", isoPath.c_str(), path.c_str());
+                return nullptr;
+            }
+            uint64_t end = 0;
+            for (const ComposedFile::Extent& extent : file->extents)
+            {
+                const uint64_t limit = extent.from == ComposedFile::Extent::From::kDisc ? node->second.info.size
+                    : extent.from == ComposedFile::Extent::From::kMemory                ? file->memory.size()
+                                                                                        : UINT64_MAX;
+                if (extent.offset != end || extent.length > file->size - end || extent.at > limit || extent.length > limit - extent.at)
+                {
+                    LOG_ERROR("%s: the composed %s's extents aren't in order, or lie outside its sources", isoPath.c_str(), path.c_str());
+                    return nullptr;
+                }
+                end += extent.length;
+            }
+            if (end != file->size)
+            {
+                LOG_ERROR("%s: the composed %s's extents don't reach its end", isoPath.c_str(), path.c_str());
+                return nullptr;
+            }
+        }
+        image->composed = std::move(composed);
 
-        LOG_INFO("Disc image %s: partition at 0x%llX, %zu entries", isoPath.c_str(), (unsigned long long)image->partition, image->nodes.size() - 1);
+        LOG_INFO("Disc image %s: partition at 0x%llX, %zu entries%s", isoPath.c_str(), (unsigned long long)image->partition, image->nodes.size() - 1,
+            image->composed.empty() ? "" : (", " + std::to_string(image->composed.size()) + " served composed").c_str());
         return std::make_unique<IsoDevice>(std::move(image));
     }
 }

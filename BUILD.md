@@ -1,6 +1,8 @@
 # Building Dead or Alive Xtreme 2 for Windows
 
-You need your own Dead or Alive Xtreme 2 (USA) disc image (.iso).
+You need your own Dead or Alive Xtreme 2 (USA) disc image (.iso) and the game's Title Update 2 for that disc, as the
+Xbox 360 downloads it: the package `TU_1A461UI_000000C000000.00000000000G3`, which a console keeps in its hard disk's
+`Cache` folder. The game is built from Title Update 2's code, which the releases play too.
 
 ## Requirements
 
@@ -26,8 +28,10 @@ They take about 10 GB, and the build a few GB more.
    powershell -ExecutionPolicy Bypass -File setup.ps1
    ```
 
-   It asks for your disc image (or pass `-Iso <path>`), recompiles the game's code, offers to download FFmpeg (about
-   90 MB), and builds the game into the `game` folder (or `-Destination <folder>`).
+   It asks for your disc image and the Title Update 2 package (or pass `-Iso <path>` and `-Tu2Package <path>`, or put
+   them in the `doax2-recomp` folder), makes Title Update 2's executable from them and recompiles its code, offers to
+   download FFmpeg (about 90 MB), and builds the game into the `game` folder (or `-Destination <folder>`), with the
+   version patch that plays your disc as Title Update 2.
 
 3. Start `game\Dead or Alive Xtreme 2.lnk`.
 

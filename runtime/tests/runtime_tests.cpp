@@ -20,6 +20,7 @@
 #include "page_heap.h"
 #include "settings.h"
 #include "util/image.h"
+#include "version_patch.h"
 #include "vfs/iso_device.h"
 #include "vfs/vfs.h"
 #include "xam/achievements.h"
@@ -432,9 +433,9 @@ static void test_module()
     const uint32_t entry = guest::LoadU32(handleVariable);
     const uint32_t header = guest::LoadU32(entry + 0x58);
     CHECK(header == kernel::ExecutableXexHeader() && guest::LoadU32(header) == 0x58455832, "handle -> entry -> XEX2 header");
-    CHECK(guest::LoadU32(entry + 0x3C) == 0x82784C18, "entry point in loader entry");
+    CHECK(guest::LoadU32(entry + 0x3C) == 0x82785D78, "entry point in loader entry");
 
-    CHECK(call(__imp__RtlImageXexHeaderField, header, 0x00010100) == 0x82784C18, "inline value (entry point)");
+    CHECK(call(__imp__RtlImageXexHeaderField, header, 0x00010100) == 0x82785D78, "inline value (entry point)");
     const uint32_t execution = call(__imp__RtlImageXexHeaderField, header, 0x00040006);
     CHECK(execution && guest::LoadU32(execution + 12) == 0x544307D2, "execution info -> title id %08X", execution ? guest::LoadU32(execution + 12) : 0);
     CHECK(call(__imp__RtlImageXexHeaderField, header, 0x00020401) == 0, "absent header (default heap size)");
@@ -1596,7 +1597,37 @@ static void test_disc_image()
     CHECK(disc::ReadExecutable(fake.string(), xex) == disc::Check::kUnreadable, "a file of zeros");
     std::filesystem::remove(fake);
 
-    // The real executable (development checkouts have it in private/): checked, and unpacked into default.pe.
+    // A made-up executable without compression, as XenonUtils' patcher writes a title update's: its payload is the image,
+    // whose rest is zeros.
+    {
+        const auto setBe32 = [](std::vector<uint8_t>& data, size_t offset, uint32_t value) {
+            for (int i = 0; i < 4; i++)
+                data[offset + i] = uint8_t(value >> (24 - 8 * i));
+        };
+        std::vector<uint8_t> made(0x200 + 0x2000), image;
+        memcpy(made.data(), "XEX2", 4);
+        setBe32(made, 8, 0x200);      // the header's size: the payload follows it
+        setBe32(made, 16, 0x100);     // the security info
+        setBe32(made, 20, 1);         // one optional header, the file format info
+        setBe32(made, 24, 0x3FF);
+        setBe32(made, 28, 0x40);
+        setBe32(made, 0x40, 8);       // neither encrypted nor compressed (0x44)
+        setBe32(made, 0x104, 0x3000); // the image's size
+        for (size_t i = 0x200; i < made.size(); i++)
+            made[i] = uint8_t(i * 7);
+        CHECK(disc::Unpack(made, image) && image.size() == 0x3000 && std::equal(made.begin() + 0x200, made.end(), image.begin()) &&
+                std::all_of(image.begin() + 0x2000, image.end(), [](uint8_t value) { return value == 0; }),
+            "an executable without compression");
+        setBe32(made, 0x104, 0x1000);
+        CHECK(!disc::Unpack(made, image), "a payload larger than its image");
+        setBe32(made, 0x104, 0x3000);
+        setBe32(made, 0x44, 2); // LZX
+        CHECK(!disc::Unpack(made, image), "a compression that isn't handled");
+    }
+
+    // The real executable (development checkouts have it in private/): checked, and unpacked into default.pe. It's its
+    // disc's, unless the supported version is on no disc (a title update's, which every disc plays with a version patch).
+    constexpr bool kOnDisc = false; // Title Update 2
     std::ifstream file("private/default.xex", std::ios::binary | std::ios::ate);
     if (!file)
     {
@@ -1606,27 +1637,693 @@ static void test_disc_image()
     xex.resize(size_t(file.tellg()));
     file.seekg(0);
     file.read(reinterpret_cast<char*>(xex.data()), std::streamsize(xex.size()));
-    CHECK(disc::IsSupported(xex), "private/default.xex isn't the supported version's");
+    CHECK(disc::IsSupported(xex) == kOnDisc, "%s", kOnDisc ? "private/default.xex isn't the supported version's" : "the supported version is on a disc");
     std::vector<uint8_t> image;
     CHECK(disc::Unpack(xex, image), "unpacking");
     CHECK(image.size() == PPC_IMAGE_SIZE, "image size 0x%zX", image.size());
     const std::string imageHash = disc::Sha256(image.data(), image.size());
-    CHECK(imageHash == "f4ff72eb3f46f7b6ef13fcddbbc193aa2307adb8df1d1651197c73b694b12c2a", "image SHA-256 %s", imageHash.c_str());
+    CHECK(imageHash == "b3beee9902fd217389e935bc80687f87feea1205fb91222f1457f408da248463", "image SHA-256 %s", imageHash.c_str());
+    // The image as every player's game runs it: its code and .pdata cleared.
+    CHECK(!disc::IsSupportedImage(image), "the image before its code is cleared");
+    CHECK(disc::ClearCode(image) && disc::IsSupportedImage(image), "the image, its code cleared: SHA-256 %s", disc::Sha256(image.data(), image.size()).c_str());
     std::vector<uint8_t> changed = xex;
     changed[changed.size() / 2] ^= 1;
     CHECK(!disc::IsSupported(changed), "a changed byte");
 
-    // The disc image itself, if it's in the working directory.
+    // The disc image itself, if it's in the working directory: the supported version's disc has this default.xex, and
+    // another version's disc plays with its patch (a release's, not here) or, if its files are the supported version's,
+    // with this executable, as in a development checkout. Without either, a disc of another version is refused: for want
+    // of its patch, or when the supported version is on no disc and every disc needs one, as a release missing its own.
+    std::vector<uint8_t> pe;
+    if (std::ifstream peFile("private/default.pe", std::ios::binary | std::ios::ate); peFile)
+    {
+        pe.resize(size_t(peFile.tellg()));
+        peFile.seekg(0);
+        peFile.read(reinterpret_cast<char*>(pe.data()), std::streamsize(pe.size()));
+    }
+    const std::filesystem::path noPatches = std::filesystem::temp_directory_path() / ("doa4_no_patches_" + std::to_string(GetCurrentProcessId()));
     std::error_code error;
+    std::filesystem::create_directories(noPatches, error);
     for (const auto& entry : std::filesystem::directory_iterator(".", error))
     {
         if (entry.path().extension() != ".iso")
             continue;
+        const std::string path = entry.path().string();
         std::vector<uint8_t> fromDisc;
-        CHECK(disc::ReadExecutable(entry.path().string(), fromDisc) == disc::Check::kOk, "%s", entry.path().string().c_str());
-        CHECK(fromDisc == xex, "default.xex from the disc image differs from private/default.xex");
+        const disc::Version* version = nullptr;
+        const disc::Check check = disc::ReadExecutable(path, fromDisc, &version);
+        if (kOnDisc)
+            CHECK(check == disc::Check::kOk && fromDisc == xex, "%s: its default.xex isn't private/default.xex", path.c_str());
+        else
+            CHECK(check == disc::Check::kOtherVersion && version && version->executableOnly, "%s: not a version whose patch makes the executable alone",
+                path.c_str());
+        disc::Options options;
+        options.patchDirectory = noPatches;
+        options.developmentXex = &xex;
+        options.developmentImage = &pe;
+        disc::Game game;
+        std::string problem;
+        CHECK(disc::Prepare(path, options, game, problem) == disc::Check::kOk && game.xex == xex && disc::IsSupportedImage(game.image) &&
+                !game.version && game.files.empty(),
+            "%s with private/'s executable: %s", path.c_str(), problem.c_str());
+        options.developmentXex = options.developmentImage = nullptr;
+        const disc::Check released = disc::Prepare(path, options, game, problem);
+        if (kOnDisc)
+            CHECK(released == disc::Check::kOk && game.xex == xex && disc::IsSupportedImage(game.image), "%s as a release: %s", path.c_str(),
+                problem.c_str());
+        else
+            CHECK(released == disc::Check::kBroken && version &&
+                    problem == std::string("The version patch ") + version->patch + " is missing. Extract the release again." && !game.version,
+                "%s without its patch: %s", path.c_str(), problem.c_str());
         break;
     }
+    std::filesystem::remove_all(noPatches, error);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Version patches (version_patch.h), made up here: no game data
+
+namespace patchtest
+{
+    // LZMA as tools\versionpatch.py stores a patch's streams (5 property bytes, then the data, which ends with an end
+    // marker), from a coder of literals alone: LZMA's model with the tool's properties (lc 3, lp 0, pb 2), every byte a
+    // literal, then the end marker. Enough for made-up patches; the text's stream below, liblzma's, has matches.
+    class LiteralLzma
+    {
+    public:
+        static std::vector<uint8_t> Encode(const std::vector<uint8_t>& data)
+        {
+            if (data.empty())
+                return {};
+            LiteralLzma coder;
+            coder.m_out = { 0x5D, 0x00, 0x00, 0x01, 0x00 }; // lc 3, lp 0, pb 2; a 64 KB dictionary
+            std::vector<uint16_t> literals(8 * 0x300, 1024);   // by the previous byte's top 3 bits
+            uint16_t isMatch[4] = { 1024, 1024, 1024, 1024 };  // state 0's (literals keep it there), by position & 3
+            uint8_t previous = 0;
+            for (size_t i = 0; i < data.size(); i++)
+            {
+                coder.Bit(isMatch[i & 3], 0);
+                uint16_t* probabilities = &literals[size_t(previous >> 5) * 0x300];
+                uint32_t symbol = 1;
+                for (int k = 7; k >= 0; k--)
+                {
+                    const int bit = data[i] >> k & 1;
+                    coder.Bit(probabilities[symbol], bit);
+                    symbol = symbol << 1 | bit;
+                }
+                previous = data[i];
+            }
+            // The end marker: a match, not a repeat, of length 2 at distance 0xFFFFFFFF. Its decisions' probabilities
+            // are fresh but its kind's: not a repeat, the length's choice and 3 low bits, the distance's slot (63, 6
+            // bits), 26 direct bits and 4 aligned ones. Then the range coder's last 5 bytes.
+            coder.Bit(isMatch[data.size() & 3], 1);
+            for (const int bit : { 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 })
+                coder.Fresh(bit);
+            coder.Direct((1u << 26) - 1, 26);
+            for (int k = 0; k < 4; k++)
+                coder.Fresh(1);
+            for (int k = 0; k < 5; k++)
+                coder.ShiftLow();
+            return std::move(coder.m_out);
+        }
+
+    private:
+        void ShiftLow()
+        {
+            if (uint32_t(m_low) < 0xFF000000u || m_low >> 32)
+            {
+                uint8_t carried = m_cache;
+                do
+                {
+                    m_out.push_back(uint8_t(carried + uint8_t(m_low >> 32)));
+                    carried = 0xFF;
+                } while (--m_pending);
+                m_cache = uint8_t(uint32_t(m_low) >> 24);
+            }
+            m_pending++;
+            m_low = uint32_t(m_low) << 8;
+        }
+
+        void Normalize()
+        {
+            if (m_range < (1u << 24))
+            {
+                m_range <<= 8;
+                ShiftLow();
+            }
+        }
+
+        void Bit(uint16_t& probability, int bit)
+        {
+            const uint32_t bound = (m_range >> 11) * probability;
+            if (bit)
+            {
+                m_low += bound;
+                m_range -= bound;
+                probability = uint16_t(probability - (probability >> 5));
+            }
+            else
+            {
+                m_range = bound;
+                probability = uint16_t(probability + ((2048 - probability) >> 5));
+            }
+            Normalize();
+        }
+
+        void Fresh(int bit)
+        {
+            uint16_t probability = 1024;
+            Bit(probability, bit);
+        }
+
+        void Direct(uint32_t value, int count)
+        {
+            while (count--)
+            {
+                m_range >>= 1;
+                if (value >> count & 1)
+                    m_low += m_range;
+                Normalize();
+            }
+        }
+
+        std::vector<uint8_t> m_out;
+        uint64_t m_low = 0;
+        uint32_t m_range = 0xFFFFFFFF;
+        uint8_t m_cache = 0;
+        uint64_t m_pending = 1; // the cache's byte and the 0xFF bytes after it, not yet written
+    };
+
+    // A text of our own (not the game's) and its stream as tools\versionpatch.py stores one: liblzma's, preset 9.
+    constexpr char kTextSentence[] = "LZMA test: a version patch's streams decompress with the LZMA SDK's decoder. ";
+    constexpr size_t kTextSize = 200;
+    constexpr uint8_t kTextLzma[] = {
+        0x5D, 0x00, 0x00, 0x00, 0x04, 0x00, 0x26, 0x16, 0x85, 0xBC, 0x45, 0xF1, 0x33, 0x31, 0xEB, 0xA2,
+        0xA1, 0x80, 0xD4, 0x0E, 0xF0, 0x34, 0x7D, 0xE8, 0xC7, 0xE4, 0xE7, 0x1E, 0x19, 0xC6, 0x33, 0x84,
+        0x90, 0xBB, 0xE6, 0x5B, 0xAA, 0xE0, 0x35, 0xDC, 0x7D, 0xBD, 0x12, 0x01, 0xAC, 0x55, 0x46, 0xF7,
+        0xF8, 0x92, 0x1F, 0x50, 0x28, 0x81, 0xB2, 0xD7, 0xE6, 0x82, 0x06, 0xCA, 0x33, 0xA0, 0x09, 0xC7,
+        0x0C, 0xF9, 0xB3, 0x3C, 0x20, 0xA9, 0x01, 0x0A, 0xAC, 0xAF, 0xE7, 0x7B, 0x0A, 0x39, 0x2C, 0x19,
+        0x4B, 0x3F, 0xFD, 0xED, 0x97, 0x80,
+    };
+
+    std::vector<uint8_t> Text()
+    {
+        std::string text;
+        while (text.size() < kTextSize)
+            text += kTextSentence;
+        return std::vector<uint8_t>(text.begin(), text.begin() + kTextSize);
+    }
+
+    struct Op
+    {
+        uint8_t operation; // 0 copy, 1 add, 2 insert, 3 skip
+        int64_t seek;
+        uint64_t length;
+    };
+
+    // A piece as the patch file has it, before its streams are compressed; and what can be wrong with it.
+    struct Piece
+    {
+        std::string name;
+        std::vector<uint8_t> source, result; // their sizes and SHA-256s
+        std::vector<Op> ops;
+        std::vector<uint8_t> difference, insert;
+        uint32_t engine = 4;               // ops-lzma
+        patch::Font font;
+        std::vector<std::pair<uint64_t, uint64_t>> unclaimed; // offset, length
+        bool wrongResult = false;          // a result SHA-256 that isn't the result's
+        uint64_t resultSize = 0;           // a result size told instead of the result's (0: the result's)
+        int64_t sizeOff[3] = {};           // the streams' sizes told wrong by this much
+        size_t storedCut[3] = {};          // the streams' compressed bytes cut short by this much
+    };
+
+    template <typename T>
+    void Put(std::vector<uint8_t>& out, T value)
+    {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+        out.insert(out.end(), bytes, bytes + sizeof(T));
+    }
+
+    std::vector<uint8_t> File(const std::vector<Piece>& pieces)
+    {
+        std::vector<uint8_t> out = { 'V', 'P', 'A', 'T' };
+        Put<uint32_t>(out, 1);
+        Put<uint32_t>(out, uint32_t(pieces.size()));
+        Put<uint64_t>(out, 0);
+        for (const Piece& piece : pieces)
+        {
+            Put<uint16_t>(out, uint16_t(piece.name.size()));
+            out.insert(out.end(), piece.name.begin(), piece.name.end());
+            Put<uint64_t>(out, piece.source.size());
+            patch::Sha256 hash = patch::Hash(piece.source.data(), piece.source.size());
+            out.insert(out.end(), hash.begin(), hash.end());
+            Put<uint64_t>(out, piece.resultSize ? piece.resultSize : piece.result.size());
+            hash = patch::Hash(piece.result.data(), piece.result.size());
+            hash[0] ^= piece.wrongResult ? 1 : 0;
+            out.insert(out.end(), hash.begin(), hash.end()); // the result's
+            out.insert(out.end(), hash.begin(), hash.end()); // the target's
+            Put<uint32_t>(out, uint32_t(piece.unclaimed.size()));
+            for (const auto& [offset, length] : piece.unclaimed)
+            {
+                Put<uint64_t>(out, offset);
+                Put<uint64_t>(out, length);
+            }
+            Put<uint32_t>(out, 0); // kept
+            Put<uint32_t>(out, piece.engine);
+            for (const uint32_t value : { piece.font.mode, piece.font.entry, piece.font.sourceTable, piece.font.sourcePages, piece.font.targetTable,
+                     piece.font.targetPages })
+                Put<uint32_t>(out, value);
+            std::vector<uint8_t> control;
+            for (const Op& op : piece.ops)
+            {
+                control.push_back(op.operation);
+                Put<int64_t>(control, op.seek);
+                Put<uint64_t>(control, op.length);
+            }
+            Put<uint32_t>(out, 3);
+            const std::vector<uint8_t>* streams[3] = { &control, &piece.difference, &piece.insert };
+            for (int i = 0; i < 3; i++)
+            {
+                std::vector<uint8_t> stored = LiteralLzma::Encode(*streams[i]);
+                stored.resize(stored.size() - std::min(stored.size(), piece.storedCut[i]));
+                Put<uint64_t>(out, stored.size());
+                Put<uint64_t>(out, uint64_t(int64_t(streams[i]->size()) + piece.sizeOff[i]));
+                out.insert(out.end(), stored.begin(), stored.end());
+            }
+        }
+        return out;
+    }
+
+    // Reads a patch and applies its first piece to `source`: empty, or what's wrong.
+    std::string ReadAndApply(const std::vector<Piece>& pieces, const std::vector<uint8_t>& source, std::vector<uint8_t>* result = nullptr)
+    {
+        patch::Patch patch;
+        if (std::string problem = patch::Read(File(pieces), patch); !problem.empty())
+            return "read: " + problem;
+        std::vector<uint8_t> out;
+        std::string problem = patch::Apply(patch.pieces[0], source, out);
+        if (result)
+            *result = std::move(out);
+        return problem;
+    }
+
+    // A disc image (a plain XISO) holding one file.
+    bool WriteDiscImage(const std::filesystem::path& path, const std::string& name, const std::vector<uint8_t>& data)
+    {
+        constexpr size_t kSector = 2048;
+        std::vector<uint8_t> image(34 * kSector + (data.size() + kSector - 1) / kSector * kSector);
+        uint8_t* descriptor = image.data() + 32 * kSector;
+        memcpy(descriptor, "MICROSOFT*XBOX*MEDIA", 20);
+        const uint32_t rootSector = 33, rootSize = kSector, fileSector = 34, fileSize = uint32_t(data.size());
+        memcpy(descriptor + 20, &rootSector, 4);
+        memcpy(descriptor + 24, &rootSize, 4);
+        uint8_t* root = image.data() + 33 * kSector;
+        memset(root, 0xFF, kSector); // padding after the one entry
+        memset(root, 0, 4);          // no left or right entries
+        memcpy(root + 4, &fileSector, 4);
+        memcpy(root + 8, &fileSize, 4);
+        root[12] = 0x20;
+        root[13] = uint8_t(name.size());
+        memcpy(root + 14, name.data(), name.size());
+        memcpy(image.data() + 34 * kSector, data.data(), data.size());
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(image.data()), std::streamsize(image.size()));
+        return bool(out);
+    }
+
+    void SetBe32(std::vector<uint8_t>& data, size_t offset, uint32_t value)
+    {
+        for (int i = 0; i < 4; i++)
+            data[offset + i] = uint8_t(value >> (24 - 8 * i));
+    }
+}
+
+static void test_version_patch()
+{
+    using namespace patchtest;
+    using Extent = vfs::ComposedFile::Extent;
+
+    // A source, and a result made of it: copied, added to, inserted, skipped, then copied from further back.
+    std::vector<uint8_t> source(70000);
+    uint32_t seed = 12345;
+    for (uint8_t& byte : source)
+    {
+        seed = seed * 1103515245 + 12345;
+        byte = uint8_t(seed >> 16);
+    }
+    std::vector<uint8_t> difference(200), insert(100);
+    for (size_t i = 0; i < difference.size(); i++)
+        difference[i] = uint8_t(i % 3 ? i : 0);
+    for (size_t i = 0; i < insert.size(); i++)
+        insert[i] = uint8_t(0xA0 + i);
+    std::vector<uint8_t> result(source.begin() + 5000, source.begin() + 6000);
+    for (size_t i = 0; i < difference.size(); i++)
+        result.push_back(uint8_t(source[6000 + i] + difference[i]));
+    result.insert(result.end(), insert.begin(), insert.end());
+    result.insert(result.end(), 100, uint8_t(0));
+    result.insert(result.end(), source.begin() + 100, source.begin() + 1100);
+    Piece good;
+    good.name = "data/file.bin";
+    good.source = source;
+    good.result = result;
+    good.ops = { { 0, 5000, 1000 }, { 1, 0, 200 }, { 2, 0, 100 }, { 3, 0, 100 }, { 0, 100 - 6200, 1000 } };
+    good.difference = difference;
+    good.insert = insert;
+
+    const std::vector<uint8_t> file = File({ good });
+    patch::Patch patch;
+    CHECK(patch::Read(file, patch).empty() && patch.pieces.size() == 1 && patch.Find("data/file.bin"), "a patch");
+    std::vector<uint8_t> out;
+    CHECK(ReadAndApply({ good }, source, &out).empty() && out == result, "applied");
+
+    // The file cut short anywhere, or longer.
+    int read = 0;
+    for (size_t size = 0; size < file.size(); size++)
+        read += patch::Read(std::vector<uint8_t>(file.begin(), file.begin() + ptrdiff_t(size)), patch).empty();
+    CHECK(read == 0, "%d of the patch's %zu shorter files read", read, file.size());
+    std::vector<uint8_t> longer = file;
+    longer.push_back(0);
+    CHECK(!patch::Read(longer, patch).empty(), "a byte after the last piece");
+    std::vector<uint8_t> otherFormat = file;
+    otherFormat[4] = 2;
+    CHECK(!patch::Read(otherFormat, patch).empty(), "another format");
+
+    // Streams that don't decompress to their sizes: cut short, or told a size they don't have.
+    for (int stream = 0; stream < 3; stream++)
+    {
+        Piece cut = good;
+        cut.storedCut[stream] = 1;
+        CHECK(!ReadAndApply({ cut }, source).empty(), "stream %d cut short", stream);
+        Piece larger = good, smaller = good;
+        larger.sizeOff[stream] = 1;
+        smaller.sizeOff[stream] = -1;
+        CHECK(!ReadAndApply({ larger }, source).empty() && !ReadAndApply({ smaller }, source).empty(), "stream %d's size told wrong", stream);
+    }
+    // A stream told a size its piece allows but its bytes can't hold, 100 MB: refused before a buffer that size is made.
+    Piece told = good;
+    told.resultSize = 400u << 20;
+    told.sizeOff[1] = (100 << 20) - int64_t(difference.size());
+    CHECK(ReadAndApply({ told }, source).find("decompress") != std::string::npos, "a stream told a size its data doesn't have");
+
+    // The streams' LZMA: liblzma's stream of a text decompresses into it (matches and all), the literal coder's of the
+    // source into it.
+    const std::vector<uint8_t> text = Text(), textStream(std::begin(kTextLzma), std::end(kTextLzma));
+    const auto decompress = [](const std::vector<uint8_t>& stream, uint64_t size, std::vector<uint8_t>& out) {
+        return patch::DecompressStream(stream.data(), stream.size(), size, out);
+    };
+    CHECK(decompress(textStream, text.size(), out) && out == text, "liblzma's stream of a text");
+    CHECK(decompress(LiteralLzma::Encode(source), source.size(), out) && out == source, "the literal coder's stream of the source");
+    CHECK(decompress({}, 0, out) && out.empty(), "no bytes for none");
+    // Refused: the stream cut short anywhere, with a byte more, told other sizes, with properties LZMA doesn't have.
+    int shorter = 0;
+    for (size_t size = 0; size < textStream.size(); size++)
+        shorter += decompress(std::vector<uint8_t>(textStream.begin(), textStream.begin() + ptrdiff_t(size)), text.size(), out);
+    std::vector<uint8_t> longerStream = textStream;
+    longerStream.push_back(0);
+    CHECK(shorter == 0 && !decompress(longerStream, text.size(), out), "%d of the stream's shorter forms decompressed, or a byte after it", shorter);
+    CHECK(!decompress(textStream, text.size() - 1, out) && !decompress(textStream, text.size() + 1, out) && !decompress(textStream, 0, out) &&
+              !decompress({}, text.size(), out) && !decompress(textStream, (100u << 20), out),
+        "a stream told another size");
+    std::vector<uint8_t> unknownProperties = textStream;
+    unknownProperties[0] = 9 * 5 * 5; // past lc 8, lp 4 and pb 4
+    CHECK(!decompress(unknownProperties, text.size(), out), "properties LZMA doesn't have");
+    // A bit flipped anywhere but in the dictionary's size, which the one-call decoder doesn't use: refused, or other
+    // bytes (LZMA has no check of its own; a piece's result has its SHA-256).
+    int refused = 0, same = 0;
+    for (size_t i = 0; i < textStream.size(); i++)
+    {
+        for (int bit = 0; bit < 8 && (i == 0 || i >= 5); bit++)
+        {
+            std::vector<uint8_t> flipped = textStream;
+            flipped[i] ^= uint8_t(1 << bit);
+            if (!decompress(flipped, text.size(), out))
+                refused++;
+            else
+                same += out == text;
+        }
+    }
+    CHECK(same == 0 && refused > 0, "%d of the stream's flipped bits decompressed into the text, %d were refused", same, refused);
+
+    // What the format bounds: the engine, the pieces' names, their ranges.
+    Piece raw = good, lzms = good;
+    raw.engine = 2;
+    lzms.engine = 1;
+    CHECK(ReadAndApply({ raw }, source).find("engine") != std::string::npos && ReadAndApply({ lzms }, source).find("engine") != std::string::npos,
+        "an engine the game doesn't read (ops-raw, ops-lzms)");
+    CHECK(!patch::Read(File({ good, good }), patch).empty(), "two pieces of one name");
+    Piece ranged = good;
+    ranged.unclaimed = { { 2000, 401 } };
+    CHECK(!ReadAndApply({ ranged }, source).empty(), "a range past the piece's end");
+    ranged.unclaimed = { { 1300, 100 } };
+    CHECK(ReadAndApply({ ranged }, source).empty(), "a range within it");
+
+    // Operations out of range, or the streams not adding up.
+    const auto broken = [&](std::vector<Op> ops, size_t resultSize, size_t differences, size_t inserted) {
+        Piece piece = good;
+        piece.ops = std::move(ops);
+        piece.result.assign(resultSize, 0);
+        piece.difference.assign(differences, 1);
+        piece.insert.assign(inserted, 2);
+        return ReadAndApply({ piece }, source);
+    };
+    CHECK(!broken({ { 0, 69500, 1000 } }, 1000, 0, 0).empty(), "a copy past the source's end");
+    CHECK(!broken({ { 1, 69990, 20 } }, 20, 20, 0).empty(), "an add past the source's end");
+    CHECK(!broken({ { 0, -1, 10 } }, 10, 0, 0).empty(), "a copy before the source's start");
+    CHECK(!broken({ { 0, 10, 10 }, { 0, INT64_MIN, 10 } }, 20, 0, 0).empty(), "the farthest seek back");
+    CHECK(!broken({ { 0, INT64_MAX, 10 } }, 10, 0, 0).empty(), "the farthest seek ahead");
+    CHECK(!broken({ { 2, 0, 101 } }, 100, 0, 101).empty(), "an insert past the result's end");
+    CHECK(!broken({ { 3, 0, 5 }, { 3, 0, UINT64_MAX } }, 10, 0, 0).empty(), "a skip past the result's end");
+    CHECK(!broken({ { 7, 0, 10 } }, 10, 0, 0).empty(), "an unknown operation");
+    CHECK(!broken({ { 2, 0, 10 } }, 10, 0, 11).empty(), "an inserted byte left over");
+    CHECK(!broken({ { 1, 0, 10 } }, 10, 5, 0).empty(), "differences that run out");
+    CHECK(!broken({ { 2, 0, 9 } }, 10, 0, 9).empty(), "a result one byte short");
+    // A wrong source or result.
+    std::vector<uint8_t> otherSource = source;
+    otherSource[69999] ^= 1;
+    CHECK(ReadAndApply({ good }, otherSource).find("source") != std::string::npos, "another source");
+    otherSource.pop_back();
+    CHECK(ReadAndApply({ good }, otherSource).find("source") != std::string::npos, "a shorter source");
+    Piece wrong = good;
+    wrong.wrongResult = true;
+    CHECK(ReadAndApply({ wrong }, source).find("result") != std::string::npos, "another result");
+
+    // Composed with pages appended to the source: a copy across its end, an add from the pages, the extents as they come.
+    std::vector<uint8_t> appended(300);
+    for (size_t i = 0; i < appended.size(); i++)
+        appended[i] = uint8_t(0x55 + i);
+    Piece across = good;
+    across.ops = { { 0, 69900, 200 }, { 1, 0, 100 } };
+    across.difference.assign(100, 3);
+    across.insert.clear();
+    across.result.assign(source.begin() + 69900, source.end());
+    across.result.insert(across.result.end(), appended.begin(), appended.begin() + 100);
+    for (size_t i = 100; i < 200; i++)
+        across.result.push_back(uint8_t(appended[i] + 3));
+    CHECK(patch::Read(File({ across }), patch).empty(), "a patch reading past its source");
+    vfs::ComposedFile composed;
+    const auto reader = [&](uint64_t offset, uint8_t* buffer, size_t length) {
+        if (offset > source.size() || length > source.size() - offset)
+            return false;
+        memcpy(buffer, source.data() + offset, length);
+        return true;
+    };
+    CHECK(patch::Compose(patch.pieces[0], reader, appended, composed).empty(), "composed");
+    CHECK(composed.size == 300 && composed.extents.size() == 3, "%zu extents", composed.extents.size());
+    if (composed.extents.size() == 3)
+    {
+        const Extent& a = composed.extents[0];
+        const Extent& b = composed.extents[1];
+        const Extent& c = composed.extents[2];
+        CHECK(a.offset == 0 && a.length == 100 && a.from == Extent::From::kDisc && a.at == 69900, "the source's part");
+        CHECK(b.offset == 100 && b.length == 100 && b.from == Extent::From::kMemory && b.at == 0, "the pages' part");
+        CHECK(c.offset == 200 && c.length == 100 && c.from == Extent::From::kMemory && c.at == 300, "the part made");
+    }
+    CHECK(!patch::Compose(patch.pieces[0], reader, std::vector<uint8_t>(150), composed).empty(), "pages too short for the add");
+
+    // A composed file served by a disc image: reads across its extents, its size in queries and listings.
+    const std::filesystem::path iso = std::filesystem::temp_directory_path() / ("doa4_patch_test_" + std::to_string(GetCurrentProcessId()) + ".iso");
+    CHECK(WriteDiscImage(iso, "Data.bin", source), "a disc image");
+    CHECK(patch::Read(File({ good }), patch).empty(), "the patch again");
+    auto served = std::make_shared<vfs::ComposedFile>();
+    CHECK(patch::Compose(patch.pieces[0], reader, {}, *served).empty(), "composed from the disc's file");
+    {
+        std::unique_ptr<vfs::Device> device = vfs::OpenIsoDevice(iso.string(), { { "data.bin", served } });
+        CHECK(device != nullptr, "the disc image with its file composed");
+        vfs::EntryInfo info;
+        CHECK(device && device->Query("DATA.BIN", info) == 0 && info.size == result.size(), "the composed size: %llu", (unsigned long long)info.size);
+        vfs::OpenRequest request;
+        request.path = "data.bin";
+        std::unique_ptr<vfs::File> opened;
+        vfs::OpenResult opening;
+        CHECK(device && device->Open(request, opened, opening) == 0 && opened, "opened");
+        bool same = opened != nullptr;
+        for (uint32_t i = 0; same && i < 400; i++)
+        {
+            seed = seed * 1103515245 + 12345;
+            const uint64_t offset = (seed >> 8) % result.size();
+            const uint32_t length = 1 + (seed >> 3) % 1500;
+            std::vector<uint8_t> buffer(length, 0xEE);
+            uint32_t transferred = 0;
+            const uint32_t status = opened->Read(buffer.data(), length, offset, transferred);
+            const uint32_t expected = uint32_t(std::min<uint64_t>(length, result.size() - offset));
+            same = status == 0 && transferred == expected && memcmp(buffer.data(), result.data() + offset, expected) == 0;
+        }
+        CHECK(same, "reads across the composed file's extents");
+        uint32_t transferred = 0;
+        uint8_t byte = 0;
+        CHECK(opened && opened->Read(&byte, 1, result.size(), transferred) != 0 && transferred == 0, "a read past the end");
+        request.path = "";
+        request.directory = true;
+        std::unique_ptr<vfs::File> root;
+        CHECK(device && device->Open(request, root, opening) == 0 && root && root->List().size() == 1 && root->List()[0].size == result.size(),
+            "listed at its composed size");
+    }
+    // Compositions that don't fit the disc: an extent past the disc's file, extents short of the end, a file it lacks.
+    for (const int kind : { 0, 1, 2 })
+    {
+        auto bad = std::make_shared<vfs::ComposedFile>(*served);
+        std::string path = "data.bin";
+        if (kind == 0)
+            bad->extents = { Extent{ 0, bad->size, Extent::From::kDisc, source.size() - 10 } };
+        else if (kind == 1)
+            bad->extents.pop_back();
+        else
+            path = "other.bin";
+        CHECK(vfs::OpenIsoDevice(iso.string(), { { path, bad } }) == nullptr, "a composition that doesn't fit (%d)", kind);
+    }
+    std::filesystem::remove(iso);
+
+    // The texture layout the font composition follows, as tools\versionpatch.py's.
+    const uint32_t tiled[][3] = { { 0, 0, 0 }, { 1, 0, 1 }, { 7, 0, 7 }, { 8, 0, 64 }, { 31, 0, 199 }, { 32, 0, 512 }, { 0, 1, 16 }, { 0, 2, 8 }, { 0, 8, 384 },
+        { 0, 16, 2048 }, { 0, 31, 2488 }, { 0, 32, 32768 }, { 5, 9, 405 }, { 100, 200, 198532 }, { 511, 513, 538327 }, { 1023, 1023, 1048447 },
+        { 640, 77, 86448 }, { 33, 991, 986041 } };
+    for (const auto& [x, y, offset] : tiled)
+        CHECK(patch::TiledOffset(x, y, 1024) == offset, "(%u, %u): %u", x, y, patch::TiledOffset(x, y, 1024));
+
+    // A font composed: a package with one page of three glyphs (A, B, C), and a result table of two pages (C and a glyph
+    // the source lacks; A and B).
+    constexpr uint32_t kBase = 0x82000000, kPage = 1 << 20;
+    std::vector<uint8_t> package(0x1000 + kPage);
+    memcpy(package.data(), "XPR2", 4);
+    SetBe32(package, 4, 0x1000 - 12); // the header's size: the textures' data at 0x1000
+    SetBe32(package, 12, 1);
+    SetBe32(package, 16 + 4, 0x100); // the resource's place and size: its fetch constant at 12 + 0x100 + 32 - 24
+    SetBe32(package, 16 + 8, 32);
+    SetBe32(package, 0x118, 2);                         // data at 0, 8-bit
+    SetBe32(package, 0x11C, 1023 | 1023u << 13);        // 1024x1024
+    const auto texel = [](uint32_t cell, uint32_t x, uint32_t y) { return patch::TiledOffset((cell % 32) * 32 + x, (cell / 32) * 32 + y, 1024); };
+    for (uint32_t cell = 0; cell < 3; cell++)
+    {
+        for (uint32_t y = 0; y < 32; y++)
+        {
+            for (uint32_t x = 0; x < 32; x++)
+                package[0x1000 + texel(cell, x, y)] = uint8_t(0x40 * (cell + 1) + (x + y) % 16);
+        }
+    }
+    const auto table = [](std::vector<uint8_t>& image, const std::vector<std::pair<uint32_t, std::vector<uint16_t>>>& pages) {
+        image.assign(0x1000, 0);
+        uint32_t list = 0x400;
+        for (size_t page = 0; page < pages.size(); page++)
+        {
+            SetBe32(image, 0x100 + page * 16, pages[page].first);
+            SetBe32(image, 0x100 + page * 16 + 4, uint32_t(pages[page].second.size()));
+            SetBe32(image, 0x100 + page * 16 + 8, 0x04000400);
+            SetBe32(image, 0x100 + page * 16 + 12, kBase + list);
+            for (const uint16_t code : pages[page].second)
+            {
+                image[list] = uint8_t(code >> 8);
+                image[list + 1] = uint8_t(code);
+                list += 2;
+            }
+        }
+    };
+    std::vector<uint8_t> sourceImage, resultImage, pages;
+    table(sourceImage, { { 0, { 'A', 'B', 'C' } } });
+    table(resultImage, { { 5, { 'C', 0x5000 } }, { 6, { 'A', 'B' } } });
+    patch::Font font;
+    font.mode = 2;
+    font.sourceTable = kBase + 0x100;
+    font.sourcePages = 1;
+    font.targetTable = kBase + 0x100;
+    font.targetPages = 2;
+    CHECK(patch::ComposeFont(font, package, sourceImage, kBase, resultImage, kBase, pages).empty() && pages.size() == 2 * kPage, "a font composed");
+    bool placed = pages.size() == 2 * kPage;
+    // (page, cell) of the result, and the source's cell it must hold, or -1: blank.
+    const int expected[][3] = { { 0, 0, 2 }, { 0, 1, -1 }, { 0, 2, -1 }, { 1, 0, 0 }, { 1, 1, 1 } };
+    for (const auto& [page, cell, from] : expected)
+    {
+        for (uint32_t y = 0; placed && y < 32; y++)
+        {
+            for (uint32_t x = 0; placed && x < 32; x++)
+                placed = pages[page * kPage + texel(cell, x, y)] == (from < 0 ? 0 : package[0x1000 + texel(uint32_t(from), x, y)]);
+        }
+    }
+    CHECK(placed, "each glyph in its cell, the one the source lacks blank");
+    font.targetTable = kBase + 0xFF8; // the table past the image's end
+    CHECK(!patch::ComposeFont(font, package, sourceImage, kBase, resultImage, kBase, pages).empty(), "a table outside the image");
+    font.targetTable = kBase + 0x100;
+    SetBe32(package, 0x11C, 511 | 1023u << 13); // a page that isn't 1024x1024
+    CHECK(!patch::ComposeFont(font, package, sourceImage, kBase, resultImage, kBase, pages).empty(), "a page of another size");
+    package.resize(0x1000 + kPage / 2);
+    SetBe32(package, 0x11C, 1023 | 1023u << 13);
+    CHECK(!patch::ComposeFont(font, package, sourceImage, kBase, resultImage, kBase, pages).empty(), "a page past the package's end");
+
+    // The image's code and .pdata cleared, the rest kept, sections past the image's end clipped.
+    std::vector<uint8_t> image(0x1000, 0xCC);
+    memset(image.data(), 0, 0x400);
+    image[0] = 'M';
+    image[1] = 'Z';
+    const uint32_t pe = 0x80, optional = 0xE0;
+    memcpy(&image[0x3C], &pe, 4);
+    memcpy(&image[pe], "PE\0\0", 4);
+    const uint16_t sections = 4;
+    memcpy(&image[pe + 6], &sections, 2);
+    memcpy(&image[pe + 20], &optional, 2);
+    struct Section
+    {
+        const char* name;
+        uint32_t address, size, flags;
+    };
+    const Section layout[] = { { ".text", 0x400, 0x100, 0x60000020 }, { ".pdata", 0x500, 0x80, 0x40000040 }, { ".data", 0x600, 0x100, 0xC0000040 },
+        { "PSFD00", 0xF00, 0x10000, 0x60000020 } };
+    for (size_t i = 0; i < std::size(layout); i++)
+    {
+        uint8_t* entry = &image[pe + 24 + optional + i * 40];
+        memcpy(entry, layout[i].name, strlen(layout[i].name));
+        memcpy(entry + 8, &layout[i].size, 4);
+        memcpy(entry + 12, &layout[i].address, 4);
+        memcpy(entry + 36, &layout[i].flags, 4);
+    }
+    CHECK(disc::ClearCode(image), "a PE image");
+    const auto all = [&](size_t from, size_t to, uint8_t value) { return std::all_of(image.begin() + ptrdiff_t(from), image.begin() + ptrdiff_t(to), [&](uint8_t b) { return b == value; }); };
+    CHECK(all(0x400, 0x580, 0) && all(0x580, 0xF00, 0xCC) && all(0xF00, 0x1000, 0) && image[0] == 'M', "code and .pdata cleared, the rest kept");
+    image[0] = 'X';
+    CHECK(!disc::ClearCode(image), "not a PE image");
+
+    // What's remembered about a disc image, by its path, size and modification time.
+    const std::filesystem::path data = std::filesystem::temp_directory_path() / ("doa4_checks_test_" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::remove_all(data);
+    const std::filesystem::path disc = data / "Some Disc.iso";
+    std::filesystem::create_directories(data);
+    {
+        std::ofstream image(disc, std::ios::binary);
+        image << "a disc image";
+    }
+    const std::string folder = data.string(), path = disc.string();
+    CHECK(disc::Remembered(folder, path, "patched").empty(), "nothing yet");
+    disc::Remember(folder, path, "patched", "abc");
+    disc::Remember(folder, path, "identity", "0123456789ABCDEF");
+    disc::Remember(folder, path, "patched", "def");
+    std::string upper = path;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+    CHECK(disc::Remembered(folder, path, "patched") == "def" && disc::Remembered(folder, upper, "identity") == "0123456789ABCDEF", "remembered");
+    CHECK(disc::Remembered("", path, "patched").empty(), "without a data directory");
+    {
+        std::ofstream image(disc, std::ios::binary | std::ios::app);
+        image << ", changed";
+    }
+    CHECK(disc::Remembered(folder, path, "patched").empty(), "forgotten once the disc image changes");
+    std::filesystem::remove_all(data);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2509,6 +3206,7 @@ int main(int argc, char** argv)
     RUN(test_heap_top_of_address_space);
     RUN(test_settings_file);
     RUN(test_disc_image);
+    RUN(test_version_patch);
     RUN(test_spa);
 
     if (!guest::Initialize())

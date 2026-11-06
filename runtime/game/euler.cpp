@@ -1,9 +1,9 @@
 // The Pool's air mattress stood upright in some frames (DOAX2-specific addresses).
 //
-// sub_825A57F8 updates a prop that follows a girl's motion (the air mattress Kokoro lies on at the Pool): it samples the
-// prop's rotation from the motion's keys as a quaternion (sub_825A4E78), converts it to Euler angles, and builds the
+// sub_825A5F98 updates a prop that follows a girl's motion (the air mattress Kokoro lies on at the Pool): it samples the
+// prop's rotation from the motion's keys as a quaternion (sub_825A5618), converts it to Euler angles, and builds the
 // prop's world matrix from them. The conversion computes m22 = 1 - 2(x^2 + y^2) and m11 = 1 - 2(x^2 + z^2) and normally
-// takes Y = atan2(-2(wy + xz), m22) and Z = atan2(-2(xy + wz), m11), but when m22 (0x825A5AF4) or m11 (0x825A5B74) is
+// takes Y = atan2(-2(wy + xz), m22) and Z = atan2(-2(xy + wz), m11), but when m22 (0x825A6294) or m11 (0x825A6314) is
 // exactly 0.0 it takes special cases built from acos and asin that give a different rotation (Euler X and Y of 90
 // degrees), which stood the mattress on end (its reflection too). The mattress's keys are Euler angles of about (90, 85,
 // 90) degrees, so its quaternions are (a, b, a, b) and m22 is 0 in exact arithmetic: whether a^2 + b^2 comes out as
@@ -23,7 +23,7 @@
 
 #include <cstdlib>
 
-// At sub_825A57F8's tests of m22 (f30, numerator f27) and m11 (f29, numerator f28) against 0.0: true skips the special
+// At sub_825A5F98's tests of m22 (f30, numerator f27) and m11 (f29, numerator f28) against 0.0: true skips the special
 // cases for that axis.
 bool EulerZeroDenominatorMidAsmHook(PPCRegister& denominator, PPCRegister& numerator)
 {
